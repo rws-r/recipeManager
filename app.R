@@ -1,51 +1,1081 @@
-#
-# This is a Shiny web application. You can run the application by clicking
-# the 'Run App' button above.
-#
-# Find out more about building applications with Shiny here:
-#
-#    https://shiny.posit.co/
-#
-
 library(shiny)
+library(uuid)
+library(DT)
+library(dplyr)
+library(later)
 
-# Define UI for application that draws a histogram
+### -- Data logic ----
+data_file <- "recipes.rds"
+if (!file.exists(data_file)) saveRDS(list(), data_file)
+
+load_recipes <- function() readRDS(data_file)
+save_recipes <- function(data) saveRDS(data, data_file)
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+### -- UI ----
 ui <- fluidPage(
+  titlePanel("Recipe Manager"),
+  tabsetPanel(id = "main_tabs",  # <-- Add ID so we can switch tabs
+              tabPanel("Recipe Book",
+                       sidebarLayout(
+                         sidebarPanel(
+                           width = 7,
+                           textInput("title", "Recipe Title"),
+                           textAreaInput("instructions", "Instructions", rows = 5),
+                           textInput("source", "Source (website, book, etc.)", value = ""),
+                           h4("Ingredients"),
+                           uiOutput("ingredient_ui"),
+                           actionButton("add_ing", "Add Ingredient"),
+                           hr(),
+                           actionButton("save_recipe", "Save Recipe"),
+                           textOutput("save_status"),
+                           conditionalPanel(
+                             condition = "output.is_editing_rec === true",
+                             actionButton("cancel_edit", "Cancel Edit", icon = icon("times"), style = "margin-top: 10px;")
+                           )
+                         ),
+                         mainPanel(
+                           width = 5,
+                           h3("Saved Recipes"),
+                           DTOutput("recipe_table"),
+                           uiOutput("recipe_viewer")
+                         )
+                       )
+              ),
+              tabPanel("Shopping List",
+                       h3("Select Recipes"),
+                       DTOutput("shopping_table"),
+                       uiOutput("multiplier_inputs"),  # New: multipliers per recipe
+                       h3("Generated Shopping List"),
+                       uiOutput("shopping_list")       # Replace tableOutput with UI for checkboxes + header
+              ),
+              tabPanel("View Recipe",
+                       uiOutput("recipe_viewer"),
+                       value = "View Recipe"
 
-    # Application title
-    titlePanel("Old Faithful Geyser Data"),
+              ),
+              tabPanel("Saved Lists",
+                       h3("Previously Saved Shopping Lists"),
+                       DTOutput("saved_lists_table"),
+                       uiOutput("saved_list_details")
+              ),
+              tabPanel("Ingredients",
+                       h3("Canonical Ingredients"),
+                       DTOutput("canonical_table"),
+                       uiOutput("ingredient_edit_ui")
+              )
+  )
 
-    # Sidebar with a slider input for number of bins 
-    sidebarLayout(
-        sidebarPanel(
-            sliderInput("bins",
-                        "Number of bins:",
-                        min = 1,
-                        max = 50,
-                        value = 30)
-        ),
-
-        # Show a plot of the generated distribution
-        mainPanel(
-           plotOutput("distPlot")
-        )
-    )
 )
 
-# Define server logic required to draw a histogram
-server <- function(input, output) {
+# -- Server ----
+server <- function(input, output, session) {
 
-    output$distPlot <- renderPlot({
-        # generate bins based on input$bins from ui.R
-        x    <- faithful[, 2]
-        bins <- seq(min(x), max(x), length.out = input$bins + 1)
+  ## ----- Reactive Vals ----------
+  recipes_rv <- reactiveVal(load_recipes())
+  ingredients <- reactiveVal(
+    data.frame(item = "", quantity = NA_real_, unit = "cup", store = "Any",stringsAsFactors = FALSE)
+  )
+  editing_recipe_id <- reactiveVal(NULL)
+  saved_lists_rv <- reactiveVal()
+  recipe_to_delete <- reactiveVal(NULL)
+  have_items <- reactiveVal(list())
+  editing_list_id <- reactiveVal(NULL)
+  selected_indices_rv <- reactiveVal(NULL)
+  pending_canonical_decision <- reactiveVal(NULL)
 
-        # draw the histogram with the specified number of bins
-        hist(x, breaks = bins, col = 'darkgray', border = 'white',
-             xlab = 'Waiting time to next eruption (in mins)',
-             main = 'Histogram of waiting times')
+
+  output$is_editing_shop <- reactive({
+    !is.null(editing_list_id()) && nzchar(editing_list_id())
+  })
+  outputOptions(output, "is_editing_shop", suspendWhenHidden = FALSE)
+
+  output$is_editing_rec <- reactive({
+    !is.null(editing_recipe_id()) && nzchar(editing_recipe_id())
+  })
+  outputOptions(output, "is_editing_rec", suspendWhenHidden = FALSE)
+
+  proxy <- dataTableProxy("shopping_table")
+
+  ingredient_file <- "canonical_ingredients.rds"
+
+  canonical_ingredients <- if (file.exists(ingredient_file)) {
+    readRDS(ingredient_file)
+  } else {
+    character()
+  }
+  canonical_ingredients_rv <- reactiveVal(canonical_ingredients)
+
+  # ------- Functions --------
+  canonicalReplacementModal <- function(new_item, row_index) {
+    modalDialog(
+      title = paste("New Ingredient Detected:", shQuote(new_item)),
+      p("This item isn’t in the canonical list."),
+      radioButtons("canonical_decision", "What would you like to do?",
+                   choices = setNames(
+                     c("add", "replace"),
+                     c(
+                       paste0("Add '", new_item, "' to canonical list"),
+                       "Replace with existing canonical ingredient"
+                     )
+                   )
+      ),
+      conditionalPanel(
+        condition = "input.canonical_decision === 'replace'",
+        selectInput("canonical_choice", "Choose Canonical Match:",
+                    choices = isolate(canonical_ingredients_rv()))
+      ),
+      footer = tagList(
+        actionButton("confirm_canonical_action", "Confirm"),
+        modalButton("Cancel")
+      ),
+      easyClose = FALSE
+    )
+  }
+
+  # Load saved shopping lists once at startup
+  shopping_file <- "shopping_lists.rds"
+  if (file.exists(shopping_file)) {
+    saved_lists_rv(readRDS(shopping_file))
+  } else {
+    saved_lists_rv(list())
+  }
+
+
+  ## ------ Render UI: Add ingredients ---------
+  output$ingredient_ui <- renderUI({
+    df <- ingredients()
+    n <- nrow(df)
+    all_recipes <- load_recipes()
+    ingredient_pool <- attr(df, "ingredient_pool")
+    if (is.null(ingredient_pool)) {
+      ingredient_pool <- unique(unlist(lapply(all_recipes, function(r) r$ingredients$item)))
+    }
+    ingredient_pool <- sort(na.omit(ingredient_pool))
+
+    # Define known_terms here
+    known_terms <- canonical_ingredients_rv()
+
+    new_items <- trimws(tolower(df$item))
+    unknowns <- setdiff(new_items, known_terms)
+    unknowns <- unknowns[unknowns != ""]  # remove blanks
+
+
+    lapply(1:n, function(i) {
+      fluidRow(
+        column(4, selectizeInput(
+          inputId = paste0("item_", i),
+          label = "Item",
+          choices = c("", ingredient_pool),
+          selected = df$item[i] %||% "",
+          options = list(create = TRUE, maxOptions = 100)
+        )),
+        column(2, numericInput(paste0("qty_", i), "Qty", value = df$quantity[i])),
+        column(2, selectInput(paste0("unit_", i), "Unit",
+                              choices = c("tsp", "tbsp", "cup", "oz", "lb", "ml", "l", "g", "kg", "pcs", "package"),
+                              selected = df$item[i] %||% ""
+        )),
+        column(3, textInput(paste0("store_", i), "Buy At:", value = df$store[i]))
+      )
     })
+  })
+
+
+  ### ------ Observer: Add ingredients ---------
+  observeEvent(input$add_ing, {
+    df <- ingredients()
+    n <- nrow(df)
+    new_items <- character(n)
+
+    for (i in 1:n) {
+      new_items[i] <- input[[paste0("item_", i)]] %||% ""
+      df$item[i] <- new_items[i]
+      df$quantity[i] <- input[[paste0("qty_", i)]] %||% NA_real_
+      df$unit[i] <- input[[paste0("unit_", i)]] %||% "cup"
+      df$store[i] <- input[[paste0("store_", i)]] %||% "Any"
+    }
+
+    df <- rbind(df, data.frame(item = "", quantity = NA_real_, unit = "cup", store = "Any", stringsAsFactors = FALSE))
+
+    # Append new values to ingredient pool so they persist in choices
+    all_recipes <- load_recipes()
+    prev_pool <- unique(unlist(lapply(all_recipes, function(r) r$ingredients$item)))
+    new_pool <- unique(c(prev_pool, new_items))
+    attr(df, "ingredient_pool") <- new_pool  # stash it temporarily
+
+    ingredients(df)
+  })
+
+
+  ### ------ Observer: Save recipe  ---------
+  observeEvent(input$save_recipe, {
+    df <- ingredients()
+    n <- nrow(df)
+    if (input$title == "" || input$instructions == "") {
+      output$save_status <- renderText("Title and Instructions are required.")
+      return()
+    }
+    for (i in 1:n) {
+      df$item[i] <- input[[paste0("item_", i)]]
+      df$quantity[i] <- input[[paste0("qty_", i)]]
+      df$unit[i] <- input[[paste0("unit_", i)]]
+      df$store[i] <- input[[paste0("store_", i)]]
+    }
+
+    #df$item <- canonicalize(df$item, alias_table_rv())
+
+    df <- df[trimws(df$item) != "", , drop = FALSE]
+    if (nrow(df) == 0) {
+      output$save_status <- renderText("At least one valid ingredient is required.")
+      return()
+    }
+
+    # After collecting df$item
+    new_items <- unique(df$item)
+    existing_items <- canonical_ingredients_rv()
+    all_items <- sort(unique(c(existing_items, new_items)))
+
+    # Update if changed
+    if (!identical(all_items, existing_items)) {
+      canonical_ingredients_rv(all_items)
+      saveRDS(all_items, ingredient_file)
+    }
+
+
+    all_recipes <- load_recipes()
+    id_edit <- editing_recipe_id()
+
+    if (is.null(id_edit)) {
+      new_recipe <- list(
+        id = UUIDgenerate(),
+        title = input$title,
+        instructions = input$instructions,
+        source = input$source,
+        ingredients = df
+      )
+      all_recipes <- c(all_recipes, list(new_recipe))
+      output$save_status <- renderText("Recipe saved!")
+    } else {
+      idx <- which(sapply(all_recipes, `[[`, "id") == id_edit)
+      if (length(idx) == 1) {
+        all_recipes[[idx]]$title <- input$title
+        all_recipes[[idx]]$instructions <- input$instructions
+        all_recipes[[idx]]$source <- input$source
+        all_recipes[[idx]]$ingredients <- df
+
+        output$save_status <- renderText("Recipe updated!")
+      }
+      editing_recipe_id(NULL)
+    }
+
+    save_recipes(all_recipes)
+    recipes_rv(all_recipes)
+    ingredients(data.frame(item = "", quantity = NA_real_, unit = "cup", stringsAsFactors = FALSE))
+    updateTextInput(session, "title", value = "")
+    updateTextAreaInput(session, "instructions", value = "")
+    updateTextInput(session, "source", value = "")
+    editing_recipe_id(NULL)
+  })
+
+
+  ###----Observer: Direct Replacement
+  observe({
+    df <- ingredients()
+    items <- tolower(trimws(df$item))
+    known <- canonical_ingredients_rv()
+    unknowns <- which(!(items %in% known) & items != "")
+
+    if (length(unknowns) > 0 && is.null(pending_canonical_decision())) {
+      pending_canonical_decision(list(
+        row = unknowns[1],
+        name = df$item[unknowns[1]]
+      ))
+      showModal(canonicalReplacementModal(df$item[unknowns[1]], unknowns[1]))
+    }
+  })
+
+  observeEvent(input$confirm_canonical_action, {
+    decision <- isolate(input$canonical_decision)
+    row <- pending_canonical_decision()$row
+    name <- tolower(trimws(pending_canonical_decision()$name))
+    df <- ingredients()
+
+    if (decision == "add") {
+      canon <- canonical_ingredients_rv()
+      canon <- sort(unique(c(canon, name)))
+      canonical_ingredients_rv(canon)
+      saveRDS(canon, ingredient_file)
+    } else if (decision == "replace") {
+      selected <- isolate(input$canonical_choice)
+      df$item[row] <- selected
+      ingredients(df)
+    }
+
+    pending_canonical_decision(NULL)
+    removeModal()
+    showNotification("Canonical decision saved.", type = "message")
+  })
+
+  ## --------- Render: View Canonical Ingredients-------
+  output$canonical_table <- renderDT({
+    data.frame(Ingredient = canonical_ingredients_rv(), stringsAsFactors = FALSE) %>%
+      mutate(
+        Edit = sprintf('<button class="edit_ingredient" id="edit_ing_%s">Edit</button>', Ingredient),
+        Delete = sprintf('<button class="delete_ingredient" id="del_ing_%s">Delete</button>', Ingredient)
+      ) %>%
+      datatable(
+        escape = FALSE,
+        selection = "none",
+        rownames = FALSE,
+        options = list(
+          paging = TRUE,
+          searching = TRUE,
+          columnDefs = list(list(targets = c(1, 2), orderable = FALSE))
+        ),
+        callback = JS("
+        table.on('click', 'button.edit_ingredient', function() {
+          var id = $(this).attr('id');
+          Shiny.setInputValue('edit_ingredient', id, {priority: 'event'});
+        });
+        table.on('click', 'button.delete_ingredient', function() {
+          var id = $(this).attr('id');
+          Shiny.setInputValue('delete_ingredient', id, {priority: 'event'});
+        });
+      ")
+      )
+  })
+
+  ### --- Observer: Edit canonical ingredients  --------
+  observeEvent(input$edit_ingredient, {
+    ingredient <- sub("edit_ing_", "", input$edit_ingredient)
+    showModal(modalDialog(
+      title = paste("Edit Ingredient:", ingredient),
+      textInput("new_ingredient_name", "New Name", value = ingredient),
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_edit_ingredient", "Save")
+      )
+    ))
+    selected_indices_rv(ingredient)
+  })
+
+  ### --- Observer: Confirm edit canonical ingredients  --------
+  observeEvent(input$confirm_edit_ingredient, {
+    old <- selected_indices_rv()
+    new <- trimws(tolower(input$new_ingredient_name))
+    canon <- canonical_ingredients_rv()
+
+    if (new == "" || new %in% canon) {
+      showNotification("Invalid or duplicate name.", type = "error")
+      return()
+    }
+
+    canon <- setdiff(canon, old)
+    canon <- sort(unique(c(canon, new)))
+    canonical_ingredients_rv(canon)
+    saveRDS(canon, ingredient_file)
+
+    selected_indices_rv(NULL)
+    removeModal()
+    showNotification("Ingredient renamed.", type = "message")
+  })
+
+  ### ------ Observer: Delete canonical ingredients-----
+  observeEvent(input$delete_ingredient, {
+    ingredient <- sub("del_ing_", "", input$delete_ingredient)
+    showModal(modalDialog(
+      title = paste("Delete Ingredient:", ingredient),
+      "Are you sure you want to remove this ingredient from the canonical list? It won't affect existing recipes.",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_delete_ingredient", "Delete", class = "btn-danger")
+      )
+    ))
+    selected_indices_rv(ingredient)
+  })
+
+  ### ------ Observer: Confirm delete canonical ingredients ------
+  observeEvent(input$confirm_delete_ingredient, {
+    canon <- canonical_ingredients_rv()
+    canon <- setdiff(canon, selected_indices_rv())
+    canonical_ingredients_rv(canon)
+    saveRDS(canon, ingredient_file)
+    selected_indices_rv(NULL)
+    removeModal()
+    showNotification("Ingredient deleted.", type = "message")
+  })
+
+
+
+  ## ------ Render DT: Recipe table  ---------
+  output$recipe_table <- renderDT({
+    recs <- recipes_rv()
+    if (length(recs) == 0) return(data.frame())
+    df <- data.frame(
+      Title = sapply(recs, `[[`, "title"),
+      Ingredients = sapply(recs, function(r) paste(r$ingredients$item, collapse = ", ")),
+      ID = sapply(recs, `[[`, "id"),
+      stringsAsFactors = FALSE
+    )
+    df$View <- sprintf('<button class="view_btn" id="view_%s">View</button>', df$ID)
+    df$Edit <- sprintf('<button class="edit_btn" id="edit_%s">Edit</button>', df$ID)
+    df$Delete <- sprintf('<button class="delete_btn" id="del_%s">Delete</button>', df$ID)
+    datatable(
+      df[, c("Title", "Ingredients", "View","Edit", "Delete")],
+      escape = FALSE,
+      selection = "single",
+      rownames = FALSE,
+      options = list(
+        paging = TRUE,
+        searching = TRUE,
+        columnDefs = list(list(targets = c(2, 3), orderable = FALSE))  # Edit/Delete columns
+      ),
+      callback = JS("
+     table.on('click', 'button.view_btn', function() {
+      var id = $(this).attr('id');
+      Shiny.setInputValue('view_recipe', id, {priority: 'event'});
+    });
+    table.on('click', 'button.edit_btn', function() {
+      var id = $(this).attr('id');
+      Shiny.setInputValue('edit_recipe', id, {priority: 'event'});
+    });
+    table.on('click', 'button.delete_btn', function() {
+      var id = $(this).attr('id');
+      Shiny.setInputValue('delete_recipe', id, {priority: 'event'});
+    });
+  ")
+    )
+
+  })
+
+  ### ------- Observer: View recipe ------
+  observeEvent(input$view_recipe, {
+    id <- sub("view_", "", input$view_recipe)
+    recs <- recipes_rv()
+    recipe <- Filter(function(r) r$id == id, recs)[[1]]
+    if (!is.null(recipe)) {
+      selected_recipe(recipe)
+      updateTabsetPanel(session, "main_tabs", selected = "View Recipe")
+    }
+  })
+
+
+  ### ------ Observer: Edit recipe ---------
+  observeEvent(input$edit_recipe, {
+    id <- sub("edit_", "", input$edit_recipe)
+    recs <- load_recipes()
+    recipe <- Filter(function(r) r$id == id, recs)[[1]]
+    if (!is.null(recipe)) {
+      updateTextInput(session, "title", value = recipe$title)
+      updateTextAreaInput(session, "instructions", value = recipe$instructions)
+      updateTextInput(session, "source", value = recipe$source %||% "")
+      ingredients(recipe$ingredients)
+      editing_recipe_id(id)
+      output$save_status <- renderText("Editing recipe...")
+      output$is_editing_rec <- reactive({
+        !is.null(editing_recipe_id())
+      })
+      outputOptions(output, "is_editing_rec", suspendWhenHidden = FALSE)
+
+    }
+  })
+
+  ### ------ Observer: Cancel edit recipe ---------
+  observeEvent(input$cancel_edit, {
+    editing_recipe_id(NULL)
+    ingredients(data.frame(item = "", quantity = NA_real_, unit = "cup", stringsAsFactors = FALSE))
+    updateTextInput(session, "title", value = "")
+    updateTextAreaInput(session, "instructions", value = "")
+    updateTextAreaInput(session, "source", value = "")
+    output$save_status <- renderText("Edit cancelled.")
+  })
+
+
+  ### ------ Observer: Delete recipe ---------
+  observeEvent(input$delete_recipe, {
+    id <- sub("del_", "", input$delete_recipe)
+
+    if (is.null(id) || id == "" || !id %in% sapply(recipes_rv(), `[[`, "id")) {
+      showNotification("Invalid recipe selected for deletion.", type = "error")
+      return()
+    }
+
+    recipe_to_delete(id)
+
+    showModal(modalDialog(
+      title = "Confirm Delete",
+      "Are you sure you want to delete this recipe?",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_delete", "Delete", class = "btn-danger")
+      ),
+      easyClose = TRUE,
+      fade = TRUE
+    ))
+  })
+
+
+  ### ------ Observer: Confirm delete ---------
+  observeEvent(input$confirm_delete, {
+    req(recipe_to_delete())
+    recs <- recipes_rv()
+    recs <- Filter(function(r) r$id != recipe_to_delete(), recs)
+    save_recipes(recs)
+    recipes_rv(recs)
+    output$save_status <- renderText("Recipe deleted.")
+    recipe_to_delete(NULL)
+    removeModal()
+    ingredients(data.frame(item = "", quantity = NA_real_, unit = "cup", stringsAsFactors = FALSE))
+    updateTextInput(session, "title", value = "")
+    updateTextAreaInput(session, "instructions", value = "")
+    editing_recipe_id(NULL)
+  })
+
+  selected_recipe <- reactiveVal(NULL)
+
+  ### ------ Observer: Recipe table rows selected ---------
+  observeEvent(input$confirm_delete, {
+    req(recipe_to_delete())
+    recs <- recipes_rv()
+    if (length(recs) == 0) {
+      showNotification("No recipes to delete.", type = "error")
+      return()
+    }
+
+    recs <- Filter(function(r) r$id != recipe_to_delete(), recs)
+    recipes_rv(recs)
+    save_recipes(recs)
+
+    output$save_status <- renderText("Recipe deleted.")
+    recipe_to_delete(NULL)
+    removeModal()
+
+    # Reset inputs
+    ingredients(data.frame(item = "", quantity = NA_real_, unit = "cup", stringsAsFactors = FALSE))
+    updateTextInput(session, "title", value = "")
+    updateTextAreaInput(session, "instructions", value = "")
+    editing_recipe_id(NULL)
+  })
+
+
+  ## ------ Render UI: Recipe viewer ---------
+  output$recipe_viewer <- renderUI({
+    recipe <- selected_recipe()
+    if (is.null(recipe)) return(NULL)
+    tagList(
+      h2(recipe$title),
+      tags$div(
+        style = "white-space: pre-wrap; word-wrap: break-word;",
+        recipe$instructions
+      ),
+      if (!is.null(recipe$source) && nzchar(recipe$source)) {
+        tagList(
+          h4("Source"),
+          p(recipe$source)
+        )
+      },
+      h4("Ingredients"),
+      tableOutput("ingredients_table"),
+      actionButton("back_to_book", "Back to Recipe Book")
+    )
+  })
+
+  ### ------- Observer: Back to recipe book --------
+  observeEvent(input$back_to_book, {
+    updateTabsetPanel(session, "main_tabs", selected = "Recipe Book")
+  })
+
+
+  ## ------ Render Table: Ingredients table ---------
+  output$ingredients_table <- renderTable({
+    recipe <- selected_recipe()
+    if (is.null(recipe)) return(NULL)
+    recipe$ingredients
+  }, rownames = FALSE)
+
+  # ---- Render DT: Shopping table ----
+  output$shopping_table <- renderDT({
+    recs <- recipes_rv()
+    df <- data.frame(
+      Title = sapply(recs, `[[`, "title"),
+      stringsAsFactors = FALSE
+    )
+    datatable(df, selection = "multiple", rownames = FALSE)
+  }, server = TRUE)  # <-- here
+
+
+
+  observeEvent(editing_list_id(), {
+    req(editing_list_id())
+    saved_lists <- saved_lists_rv()
+    sel <- Filter(function(x) x$id == editing_list_id(), saved_lists)
+    if(length(sel) == 1) {
+      saved_recipe_ids <- sapply(sel[[1]]$recipes, `[[`, "id")
+      all_recs <- recipes_rv()
+      selected_indices <- which(sapply(all_recs, function(r) r$id) %in% saved_recipe_ids)
+
+      selectRows(proxy, selected_indices)
+    }
+  })
+
+
+  # Reactive to store multipliers keyed by recipe ID
+  recipe_multipliers <- reactiveVal(list())
+
+  # UI: render numericInputs for selected recipes
+  output$multiplier_inputs <- renderUI({
+    req(input$shopping_table_rows_selected)
+    recs <- recipes_rv()[input$shopping_table_rows_selected]
+
+    lapply(recs, function(r) {
+      numericInput(
+        inputId = paste0("multiplier_", r$id),
+        label = paste0("Multiplier for: ", r$title),
+        value = recipe_multipliers()[[r$id]] %||% 1,
+        min = 1, step = 1
+      )
+    })
+  })
+
+  ## ------ Render UI: Shopping list  ---------
+  output$shopping_list <- renderUI({
+    req(input$shopping_table_rows_selected)
+    recs <- recipes_rv()[input$shopping_table_rows_selected]
+
+    mults <- recipe_multipliers()
+
+    all_ingredients <- do.call(rbind, lapply(recs, function(r) {
+      multiplier <- mults[[r$id]] %||% 1
+      df <- r$ingredients
+      df$quantity <- df$quantity * multiplier
+      df
+    }))
+    # Group and sum quantities
+    all_ingredients <- all_ingredients %>%
+      group_by(item, unit, store) %>%
+      summarise(quantity = sum(quantity, na.rm = TRUE), .groups = "drop")
+
+    state <- have_items()
+    all_ingredients$have <- sapply(all_ingredients$item, function(x) isTRUE(state[[x]]))
+    all_ingredients <- all_ingredients %>% arrange(have, item)
+
+    rows <- lapply(1:nrow(all_ingredients), function(i) {
+      row <- all_ingredients[i, ]
+      checkbox_id <- paste0("have_", gsub("\\s+", "_", row$item))
+
+
+      fluidRow(
+        style = if (row$have) "color: #aaa; text-decoration: line-through;" else "",
+        column(1, checkboxInput(checkbox_id, NULL, value = row$have)),
+        column(5, row$item),
+        column(2, row$quantity),
+        column(2, row$unit),
+        column(2, row$store)
+      )
+    })
+
+    # Add header
+    tagList(
+      fluidRow(
+        column(1, strong("I have it")),
+        column(5, strong("Ingredient")),
+        column(2, strong("Quantity")),
+        column(2, strong("Unit")),
+        column(2, strong("Buy At:"))
+      ),
+      tags$hr(),
+      rows,
+      conditionalPanel(
+        condition = "output.is_editing_shop === false",
+        tagList(
+          actionButton("complete_list", "Save Shopping List"),
+          textOutput("complete_status")
+        )
+      ),
+      conditionalPanel(
+        condition = "output.is_editing_shop === true",
+        tagList(
+          actionButton("save_edited_list", "Save Edited Shopping List"),
+          actionButton("cancel_edit_list", "Cancel Edit"),
+          textOutput("complete_status")
+        )
+      )
+
+    )
+
+  })
+
+  ### ---- Observer: Shopping List Have Items ---------
+  observe({
+    req(input$shopping_table_rows_selected)
+    recs <- recipes_rv()[input$shopping_table_rows_selected]
+    all_ingredients <- do.call(rbind, lapply(recs, function(r) r$ingredients))
+    all_ingredients <- all_ingredients %>%
+      group_by(item, unit) %>%
+      summarise(quantity = sum(quantity, na.rm = TRUE), .groups = "drop")
+
+    current_state <- have_items()
+
+    # Update state from inputs
+    for (item in all_ingredients$item) {
+      id <- paste0("have_", gsub("\\s+", "_", item))
+      if (!is.null(input[[id]])) {
+        current_state[[item]] <- input[[id]]
+      }
+    }
+
+    have_items(current_state)
+  })
+
+  ###----- Observer: Multiplier in shopping list -------
+  # Observe multiplier changes and store in reactiveVal
+  observe({
+    req(input$shopping_table_rows_selected)
+    recs <- recipes_rv()[input$shopping_table_rows_selected]
+    current <- recipe_multipliers()
+
+    for (r in recs) {
+      id <- paste0("multiplier_", r$id)
+      val <- input[[id]]
+      if (!is.null(val) && is.numeric(val) && val > 0) {
+        current[[r$id]] <- val
+      } else {
+        current[[r$id]] <- 1
+      }
+    }
+
+    recipe_multipliers(current)
+  })
+
+  ### ----- Observer: Complete Shopping List -----------
+  observeEvent(input$complete_list, {
+    req(input$shopping_table_rows_selected)  # Require some recipes selected
+
+    # Get currently selected recipes and their multipliers
+    recs <- recipes_rv()[input$shopping_table_rows_selected]
+    mults <- recipe_multipliers()
+
+    # Build full ingredient list with multipliers applied
+    all_ingredients <- do.call(rbind, lapply(recs, function(r) {
+      multiplier <- mults[[r$id]] %||% 1
+      df <- r$ingredients
+      df$quantity <- df$quantity * multiplier
+      df
+    }))
+
+    # Group and sum quantities by item, unit, store
+    all_ingredients <- all_ingredients %>%
+      group_by(item, unit, store) %>%
+      summarise(quantity = sum(quantity, na.rm = TRUE), .groups = "drop")
+
+    # Exclude items that user marked as "have"
+    state <- have_items()
+    all_ingredients$have <- sapply(all_ingredients$item, function(x) isTRUE(state[[x]]))
+    shopping_to_save <- all_ingredients %>% filter(!have)
+
+    if(nrow(shopping_to_save) == 0) {
+      output$complete_status <- renderText("No items to save (all marked as 'have').")
+      return()
+    }
+
+    # Load existing saved shopping lists or create empty
+    shopping_file <- "shopping_lists.rds"
+    if (file.exists(shopping_file)) {
+      saved_lists <- readRDS(shopping_file)
+    } else {
+      saved_lists <- list()
+    }
+
+    # Create new shopping list entry with timestamp and unique id, and recipe.
+    selected_recipe_info <- lapply(recs, function(r) {
+      list(
+        id = r$id,
+        title = r$title,
+        multiplier = mults[[r$id]] %||% 1
+      )
+    })
+
+    new_entry <- list(
+      id = UUIDgenerate(),
+      timestamp = Sys.time(),
+      recipes = selected_recipe_info,  # <<-- added this
+      items = shopping_to_save
+    )
+
+
+    # Update saved_lists reactive
+    current_lists <- saved_lists_rv()
+    new_lists <- c(current_lists, list(new_entry))
+    saved_lists_rv(new_lists)
+
+    # Save to disk
+    saveRDS(new_lists, "shopping_lists.rds")
+
+    output$complete_status <- renderText(paste0("Shopping list saved at ", format(new_entry$timestamp, "%Y-%m-%d %H:%M:%S")))
+  })
+
+  ###-----Observer: Save edited list ------
+  observeEvent(input$save_edited_list, {
+    req(editing_list_id())
+    saved_lists <- saved_lists_rv()
+
+    idx <- which(sapply(saved_lists, `[[`, "id") == editing_list_id())
+    if (length(idx) == 1) {
+      recs <- recipes_rv()[input$shopping_table_rows_selected]
+      mults <- recipe_multipliers()
+
+      selected_recipe_info <- lapply(recs, function(r) {
+        list(
+          id = r$id,
+          title = r$title,
+          multiplier = mults[[r$id]] %||% 1
+        )
+      })
+
+      all_ingredients <- do.call(rbind, lapply(recs, function(r) {
+        multiplier <- mults[[r$id]] %||% 1
+        df <- r$ingredients
+        df$quantity <- df$quantity * multiplier
+        df
+      }))
+
+      all_ingredients <- all_ingredients %>%
+        group_by(item, unit, store) %>%
+        summarise(quantity = sum(quantity, na.rm = TRUE), .groups = "drop")
+
+      saved_lists[[idx]]$recipes <- selected_recipe_info
+      saved_lists[[idx]]$items <- all_ingredients
+      saved_lists[[idx]]$timestamp <- Sys.time()
+
+      saveRDS(saved_lists, "shopping_lists.rds")
+      saved_lists_rv(saved_lists)
+
+      showNotification("Shopping list updated successfully.", type = "message")
+    }
+  })
+
+
+  ## ------ Render DT: Saved Shopping LIsts -----------
+  output$saved_lists_table <- renderDT({
+    saved_lists <- saved_lists_rv()
+
+    # Handle empty saved_lists safely
+    if (length(saved_lists) == 0) {
+      # Return an empty data frame with the required columns
+      df_empty <- data.frame(
+        Time = character(0),
+        Recipes = character(0),
+        View = character(0),
+        Delete = character(0),
+        stringsAsFactors = FALSE
+      )
+      return(datatable(
+        df_empty,
+        escape = FALSE,
+        selection = "none",
+        rownames = FALSE,
+        options = list(
+          paging = TRUE,
+          searching = FALSE,
+          columnDefs = list(list(targets = c(2, 3), orderable = FALSE))
+        )
+      ))
+    }
+
+    # Normal case: build df from saved_lists
+    df <- data.frame(
+      Time = sapply(saved_lists, function(x) format(x$timestamp, "%Y-%m-%d %H:%M")),
+      Recipes = sapply(saved_lists, function(x) paste(sapply(x$recipes, `[[`, "title"), collapse = ", ")),
+      ID = sapply(saved_lists, `[[`, "id"),
+      stringsAsFactors = FALSE
+    )
+    df$View <- sprintf('<button class="view_saved_list" id="view_%s">View</button>', df$ID)
+    df$Delete <- sprintf('<button class="delete_saved_list" id="delete_%s">Delete</button>', df$ID)
+    df$Edit <- sprintf('<button class="edit_saved_list" id="edit_%s">Edit</button>', df$ID)
+
+    datatable(
+      df[, c("Time", "Recipes", "View", "Edit", "Delete")],
+      escape = FALSE,
+      selection = "none",
+      rownames = FALSE,
+      options = list(
+        paging = TRUE,
+        searching = FALSE,
+        columnDefs = list(list(targets = c(2,3,4), orderable = FALSE))
+      ),
+      callback = JS("
+    table.on('click', 'button.edit_saved_list', function() {
+      var id = $(this).attr('id');
+      Shiny.setInputValue('edit_saved_list', id, {priority: 'event'});
+    });
+    table.on('click', 'button.view_saved_list', function() {
+        var id = $(this).attr('id');
+        Shiny.setInputValue('view_saved_list', id, {priority: 'event'});
+      });
+      table.on('click', 'button.delete_saved_list', function() {
+        var id = $(this).attr('id');
+        Shiny.setInputValue('delete_saved_list', id, {priority: 'event'});
+      });
+    ")
+    )
+  })
+
+  ### ------ Observer: Saved Shopping Lists -----------
+  observeEvent(input$view_saved_list, {
+    id <- sub("view_", "", input$view_saved_list)
+    shopping_file <- "shopping_lists.rds"
+    saved_lists <- if (file.exists(shopping_file)) readRDS(shopping_file) else list()
+    list_to_show <- Filter(function(x) x$id == id, saved_lists)
+    if (length(list_to_show) == 1) {
+      show_list <- list_to_show[[1]]
+      output$saved_list_details <- renderUI({
+        items <- show_list$items
+        tagList(
+          h4("Saved List Details"),
+          p(strong("Saved on: "), format(show_list$timestamp, "%Y-%m-%d %H:%M:%S")),
+          h5("Recipes:"),
+          tags$ul(lapply(show_list$recipes, function(r) tags$li(paste0(r$title, " (x", r$multiplier, ")")))),
+          h5("Items:"),
+          tableOutput("saved_items_table")
+        )
+      })
+
+      output$saved_items_table <- renderTable({
+        show_list$items
+      }, rownames = FALSE)
+    }
+  })
+
+  ### ------- Observer: Delete Saved Shopping List -----
+  observeEvent(input$delete_saved_list, {
+    id <- sub("delete_", "", input$delete_saved_list)
+
+    shopping_file <- "shopping_lists.rds"
+    saved_lists <- if (file.exists(shopping_file)) readRDS(shopping_file) else list()
+
+    # Filter out the list to delete
+    saved_lists <- Filter(function(x) x$id != id, saved_lists)
+
+    # Save the updated list back to disk
+    saveRDS(saved_lists, shopping_file)
+
+    # Clear details UI if currently showing this list
+    output$saved_list_details <- renderUI(NULL)
+
+    # Optionally show a message
+    output$complete_status <- renderText("Saved shopping list deleted.")
+
+    # Trigger the DT to refresh
+    output$saved_lists_table <- renderDT({
+      if (length(saved_lists) == 0) {
+        # empty data frame with columns
+        df <- data.frame(
+          Time = character(0),
+          Recipes = character(0),
+          View = character(0),
+          Delete = character(0),
+          stringsAsFactors = FALSE
+        )
+      } else {
+        df <- data.frame(
+          Time = sapply(saved_lists, function(x) format(x$timestamp, "%Y-%m-%d %H:%M")),
+          Recipes = sapply(saved_lists, function(x) paste(sapply(x$recipes, `[[`, "title"), collapse = ", ")),
+          ID = sapply(saved_lists, `[[`, "id"),
+          stringsAsFactors = FALSE
+        )
+        df$View <- sprintf('<button class="view_saved_list" id="view_%s">View</button>', df$ID)
+        df$Delete <- sprintf('<button class="delete_saved_list" id="delete_%s">Delete</button>', df$ID)
+
+        # Drop the ID column since you don't display it
+        df <- df[, c("Time", "Recipes", "View", "Delete")]
+      }
+
+      datatable(
+        df,
+        escape = FALSE,
+        selection = "none",
+        rownames = FALSE,
+        options = list(
+          paging = TRUE,
+          searching = FALSE,
+          columnDefs = list(list(targets = c(2, 3), orderable = FALSE))
+        ),
+        callback = JS("
+      table.on('click', 'button.view_saved_list', function() {
+        var id = $(this).attr('id');
+        Shiny.setInputValue('view_saved_list', id, {priority: 'event'});
+      });
+      table.on('click', 'button.delete_saved_list', function() {
+        var id = $(this).attr('id');
+        Shiny.setInputValue('delete_saved_list', id, {priority: 'event'});
+      });
+    ")
+      )
+    })
+
+  })
+
+  ###------Observer: Edit Saved Shopping List ---------
+  # ReactiveVal to hold the indices you want selected
+  selected_indices_rv <- reactiveVal(NULL)
+
+  # In your edit observer, set the indices
+  observeEvent(input$edit_saved_list, {
+    list_id <- sub("^edit_", "", input$edit_saved_list)
+    saved_lists <- saved_lists_rv()
+    sel <- Filter(function(x) x$id == list_id, saved_lists)
+    if (length(sel) == 1) {
+      editing_list_id(list_id)
+
+      saved_recipe_ids <- sapply(sel[[1]]$recipes, `[[`, "id")
+      all_recs <- recipes_rv()
+      selected_indices <- which(sapply(all_recs, function(r) r$id) %in% saved_recipe_ids)
+
+      selected_indices_rv(selected_indices)  # store indices reactively
+
+      # Also update other reactives as before...
+      new_multipliers <- list()
+      for (r in sel[[1]]$recipes) {
+        new_multipliers[[r$id]] <- r$multiplier
+      }
+      recipe_multipliers(new_multipliers)
+
+      have_items(list())
+
+      updateTabsetPanel(session, "main_tabs", selected = "Shopping List")
+    }
+  })
+
+  ###----- Observer: Wait until rows are ready   ------
+  # Observer to select rows once DT is ready (input$shopping_table_rows_all exists)
+  observe({
+    req(selected_indices_rv())
+    req(input$shopping_table_rows_all)  # DT fully loaded rows
+
+    isolate({
+      proxy %>% selectRows(selected_indices_rv())
+      selected_indices_rv(NULL)  # clear trigger so it doesn't keep reselecting
+    })
+  })
+
+
+  ###-----Observer: Cancel edit shopping list --------
+  observeEvent(input$cancel_edit_list, {
+    editing_list_id(NULL)      # Exit editing mode
+    recipe_multipliers(list()) # Reset multipliers (or reload original if needed)
+    have_items(list())         # Reset have items if needed
+
+    # Clear table selection
+    selectRows(proxy, NULL)
+
+    # Clear status message
+    output$complete_status <- renderText("Edit cancelled.")
+
+    # Optionally, switch back to non-editing mode in UI
+  })
+
+
 }
 
-# Run the application 
-shinyApp(ui = ui, server = server)
+shinyApp(ui, server)
