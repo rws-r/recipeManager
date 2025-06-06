@@ -79,7 +79,26 @@ save_recipes <- function(rec_list) {
   saveRDS(ingredients_df, "ingredients_flat.rds")
 }
 
+load_shopping_items <- function() {
+  if (file.exists("data/shopping_items.rds")) {
+    readRDS("data/shopping_items.rds")
+  } else {
+    tibble::tibble(
+      item_id = character(),
+      shopping_list_id = character(),
+      recipe_id = character(),
+      item = character(),
+      unit = character(),
+      store = character(),
+      quantity = numeric(),
+      have = logical()
+    )
+  }
+}
 
+save_shopping_items <- function(df) {
+  saveRDS(df, "data/shopping_items.rds")
+}
 
 
 `%||%` <- function(a, b) if (!is.null(a)) a else b
