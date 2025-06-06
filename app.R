@@ -38,9 +38,9 @@ save_ingredients <- function(df) {
 
 # ---- Save shopping lists to Google Sheets ----
 save_shopping_items <- function(shopping_lists) {
-  flat_df <- flatten_shopping_lists(shopping_lists)
+  #flat_df <- flatten_shopping_lists(shopping_lists)
 
-  if (nrow(flat_df) == 0) {
+  if (nrow(shopping_lists) == 0) {
     message("No shopping items to save.")
     return(invisible(NULL))
   }
@@ -49,7 +49,7 @@ save_shopping_items <- function(shopping_lists) {
   sheet_id <- ss
 
   sheet_write(
-    data = flat_df,
+    data = shopping_lists,
     ss = as_sheets_id(sheet_id),
     sheet = "shopping_items"
   )
@@ -84,6 +84,7 @@ save_shopping_items <- function(shopping_lists) {
 
 load_shopping_items <- function() {
     shopping_items <- read_sheet(ss, sheet = "shopping_items")
+
     if(!is.null(shopping_items)){
      shopping_items <- tibble::tibble(
         item_id = character(),
@@ -879,7 +880,7 @@ server <- function(input, output, session) {
     recipe_multipliers(current)
   })
 
-  # ---- Observer example snippet for complete_list ----
+  ### ---- Observer: for complete_list ----
   observeEvent(input$complete_list, {
     req(input$shopping_table_rows_selected)
 
@@ -890,43 +891,39 @@ server <- function(input, output, session) {
       multiplier <- mults[[r$id]] %||% 1
       df <- r$ingredients
       df$quantity <- df$quantity * multiplier
+      df$recipe_id <- r$id
+      df$recipe_title <- r$title
+      df$multiplier <- multiplier
       df
     }))
 
+    # Group and sum quantities by item, unit, store, recipe (optional)
     all_ingredients <- all_ingredients %>%
-      group_by(item, unit, store) %>%
+      group_by(recipe_id, recipe_title, multiplier, item, unit, store) %>%
       summarise(quantity = sum(quantity, na.rm = TRUE), .groups = "drop")
 
-    state <- have_items()
-    all_ingredients$have <- sapply(all_ingredients$item, function(x) isTRUE(state[[x]]))
-    shopping_to_save <- all_ingredients %>% filter(!have)
+    # Add shopping_list_id and timestamp for this batch
+    shopping_list_id <- UUIDgenerate()
+    timestamp <- Sys.time()
 
-    if(nrow(shopping_to_save) == 0) {
-      output$complete_status <- renderText("No items to save (all marked as 'have').")
-      return()
-    }
+    flat_shopping_list <- all_ingredients %>%
+      mutate(
+        shopping_list_id = shopping_list_id,
+        timestamp = timestamp,
+        have = FALSE  # or whatever your logic is
+      ) %>%
+      select(shopping_list_id, timestamp, recipe_id, recipe_title, multiplier, item, unit, store, quantity, have)
+
+    # Append flat_shopping_list to your reactive or saved data
 
     current_lists <- saved_lists_rv()
-    new_entry <- list(
-      id = UUIDgenerate(),
-      timestamp = Sys.time(),
-      recipes = lapply(recs, function(r) {
-        list(
-          id = r$id,
-          title = r$title,
-          multiplier = mults[[r$id]] %||% 1
-        )
-      }),
-      items = shopping_to_save
-    )
-
-    new_lists <- c(current_lists, list(new_entry))
+    new_lists <- bind_rows(current_lists, flat_shopping_list)
     saved_lists_rv(new_lists)
 
-    # Save immediately after updating reactive
+    # Save directly to Google Sheets or RDS as one flat table
     save_shopping_items(new_lists)
 
-    output$complete_status <- renderText(paste0("Shopping list saved at ", format(new_entry$timestamp, "%Y-%m-%d %H:%M:%S")))
+    output$complete_status <- renderText(paste0("Shopping list saved at ", format(timestamp, "%Y-%m-%d %H:%M:%S")))
   })
 
   ###-----Observer: Save edited list ------
@@ -972,18 +969,18 @@ server <- function(input, output, session) {
 
   ## ------ Render DT: Saved Shopping LIsts -----------
   output$saved_lists_table <- renderDT({
-    saved_lists <- saved_lists_rv()
+    shopping_lists <- saved_lists_rv()
 
-    # Handle empty saved_lists safely
-    if (length(saved_lists) == 0) {
-      # Return an empty data frame with the required columns
+    if (nrow(shopping_lists) == 0) {
       df_empty <- data.frame(
         Time = character(0),
         Recipes = character(0),
         View = character(0),
+        Edit = character(0),
         Delete = character(0),
         stringsAsFactors = FALSE
       )
+
       return(datatable(
         df_empty,
         escape = FALSE,
@@ -992,38 +989,42 @@ server <- function(input, output, session) {
         options = list(
           paging = TRUE,
           searching = FALSE,
-          columnDefs = list(list(targets = c(2, 3), orderable = FALSE))
+          columnDefs = list(list(targets = c(2, 3, 4), orderable = FALSE))
         )
       ))
     }
 
-    # Normal case: build df from saved_lists
-    df <- data.frame(
-      Time = sapply(saved_lists, function(x) format(x$timestamp, "%Y-%m-%d %H:%M")),
-      Recipes = sapply(saved_lists, function(x) paste(sapply(x$recipes, `[[`, "title"), collapse = ", ")),
-      ID = sapply(saved_lists, `[[`, "id"),
-      stringsAsFactors = FALSE
-    )
-    df$View <- sprintf('<button class="view_saved_list" id="view_%s">View</button>', df$ID)
-    df$Delete <- sprintf('<button class="delete_saved_list" id="delete_%s">Delete</button>', df$ID)
-    df$Edit <- sprintf('<button class="edit_saved_list" id="edit_%s">Edit</button>', df$ID)
+    # Group by shopping_list_id to extract timestamp and recipes
+    display_df <- shopping_lists %>%
+      group_by(shopping_list_id, timestamp) %>%
+      summarise(
+        Recipes = paste(unique(recipe_title), collapse = ", "),
+        .groups = "drop"
+      ) %>%
+      mutate(
+        View = sprintf('<button class="view_saved_list" id="view_%s">View</button>', shopping_list_id),
+        Edit = sprintf('<button class="edit_saved_list" id="edit_%s">Edit</button>', shopping_list_id),
+        Delete = sprintf('<button class="delete_saved_list" id="delete_%s">Delete</button>', shopping_list_id),
+        Time = format(timestamp, "%Y-%m-%d %H:%M")
+      ) %>%
+      select(Time, Recipes, View, Edit, Delete)
 
     datatable(
-      df[, c("Time", "Recipes", "View", "Edit", "Delete")],
+      display_df,
       escape = FALSE,
       selection = "none",
       rownames = FALSE,
       options = list(
         paging = TRUE,
         searching = FALSE,
-        columnDefs = list(list(targets = c(2,3,4), orderable = FALSE))
+        columnDefs = list(list(targets = c(2, 3, 4), orderable = FALSE))
       ),
       callback = JS("
-    table.on('click', 'button.edit_saved_list', function() {
-      var id = $(this).attr('id');
-      Shiny.setInputValue('edit_saved_list', id, {priority: 'event'});
-    });
-    table.on('click', 'button.view_saved_list', function() {
+      table.on('click', 'button.edit_saved_list', function() {
+        var id = $(this).attr('id');
+        Shiny.setInputValue('edit_saved_list', id, {priority: 'event'});
+      });
+      table.on('click', 'button.view_saved_list', function() {
         var id = $(this).attr('id');
         Shiny.setInputValue('view_saved_list', id, {priority: 'event'});
       });
@@ -1035,76 +1036,114 @@ server <- function(input, output, session) {
     )
   })
 
+
   ### ------ Observer: Saved Shopping Lists -----------
   observeEvent(input$view_saved_list, {
     id <- sub("view_", "", input$view_saved_list)
-    shopping_file <- load_shopping_items()
-    saved_lists <- if(is.null(shopping_file))list()
-    list_to_show <- Filter(function(x) x$id == id, saved_lists)
-    if (length(list_to_show) == 1) {
-      show_list <- list_to_show[[1]]
+    saved_lists <- saved_lists_rv()
+
+    # Extract rows matching the shopping_list_id
+    list_rows <- saved_lists %>% filter(shopping_list_id == id)
+
+    if (nrow(list_rows) > 0) {
+      # Extract timestamp (assume all rows have the same one)
+      timestamp <- list_rows$timestamp[1]
+
+      # Reconstruct list of recipes with multipliers
+      recipes <- list_rows %>%
+        select(recipe_id, recipe_title, multiplier) %>%
+        distinct() %>%
+        mutate(
+          title = recipe_title
+        ) %>%
+        select(id = recipe_id, title, multiplier) %>%
+        split(seq_len(nrow(.)))  # turn into list of lists
+
+      # Prepare items table
+      items <- list_rows %>%
+        select(item, unit, store, quantity, have)
+
       output$saved_list_details <- renderUI({
-        items <- show_list$items
         tagList(
           h4("Saved List Details"),
-          p(strong("Saved on: "), format(show_list$timestamp, "%Y-%m-%d %H:%M:%S")),
+          p(strong("Saved on: "), format(timestamp, "%Y-%m-%d %H:%M:%S")),
           h5("Recipes:"),
-          tags$ul(lapply(show_list$recipes, function(r) tags$li(paste0(r$title, " (x", r$multiplier, ")")))),
+          tags$ul(lapply(recipes, function(r) tags$li(paste0(r$title, " (x", r$multiplier, ")")))),
           h5("Items:"),
           tableOutput("saved_items_table")
         )
       })
 
       output$saved_items_table <- renderTable({
-        show_list$items
+        items
       }, rownames = FALSE)
     }
   })
+
 
   ### ------- Observer: Delete Saved Shopping List -----
   observeEvent(input$delete_saved_list, {
     id <- sub("delete_", "", input$delete_saved_list)
 
-    shopping_file <- load_shopping_items()
-    saved_lists <- if (is.null(shopping_file)) list()
+    # Load tibble from disk
+    saved_lists <- load_shopping_items()
 
-    # Filter out the list to delete
-    saved_lists <- Filter(function(x) x$id != id, saved_lists)
+    if (is.null(saved_lists) || nrow(saved_lists) == 0) {
+      saved_lists <- tibble(
+        item_id = character(),
+        shopping_list_id = character(),
+        recipe_id = character(),
+        item = character(),
+        unit = character(),
+        store = character(),
+        quantity = numeric(),
+        have = logical(),
+        timestamp = as.POSIXct(character()),
+        recipe_title = character(),
+        multiplier = integer()
+      )
+    }
 
-    # Save the updated list back to disk
-    save_shopping_items(saved_lists)
 
-    # Clear details UI if currently showing this list
+    # Filter out rows with the matching shopping_list_id
+    print(str(saved_lists))
+    updated_lists <- saved_lists %>% filter(shopping_list_id != id)
+
+    # Save back
+    save_shopping_items(updated_lists)
+
+    # Clear any details showing
     output$saved_list_details <- renderUI(NULL)
 
-    # Optionally show a message
+    # Optional: show a message
     output$complete_status <- renderText("Saved shopping list deleted.")
 
-    # Trigger the DT to refresh
+    # Refresh DT
+    if (nrow(updated_lists) == 0) {
+      df <- data.frame(
+        Time = character(0),
+        Recipes = character(0),
+        View = character(0),
+        Delete = character(0),
+        stringsAsFactors = FALSE
+      )
+    } else {
+      summary_df <- updated_lists %>%
+        group_by(shopping_list_id, timestamp) %>%
+        summarise(
+          Recipes = paste(unique(recipe_title), collapse = ", "),
+          .groups = "drop"
+        ) %>%
+        mutate(
+          View = sprintf('<button class="view_saved_list" id="view_%s">View</button>', shopping_list_id),
+          Delete = sprintf('<button class="delete_saved_list" id="delete_%s">Delete</button>', shopping_list_id)
+        ) %>%
+        rename(Time = timestamp)
+
+      df <- summary_df[, c("Time", "Recipes", "View", "Delete")]
+    }
+
     output$saved_lists_table <- renderDT({
-      if (length(saved_lists) == 0) {
-        # empty data frame with columns
-        df <- data.frame(
-          Time = character(0),
-          Recipes = character(0),
-          View = character(0),
-          Delete = character(0),
-          stringsAsFactors = FALSE
-        )
-      } else {
-        df <- data.frame(
-          Time = sapply(saved_lists, function(x) format(x$timestamp, "%Y-%m-%d %H:%M")),
-          Recipes = sapply(saved_lists, function(x) paste(sapply(x$recipes, `[[`, "title"), collapse = ", ")),
-          ID = sapply(saved_lists, `[[`, "id"),
-          stringsAsFactors = FALSE
-        )
-        df$View <- sprintf('<button class="view_saved_list" id="view_%s">View</button>', df$ID)
-        df$Delete <- sprintf('<button class="delete_saved_list" id="delete_%s">Delete</button>', df$ID)
-
-        # Drop the ID column since you don't display it
-        df <- df[, c("Time", "Recipes", "View", "Delete")]
-      }
-
       datatable(
         df,
         escape = FALSE,
@@ -1116,50 +1155,70 @@ server <- function(input, output, session) {
           columnDefs = list(list(targets = c(2, 3), orderable = FALSE))
         ),
         callback = JS("
-      table.on('click', 'button.view_saved_list', function() {
-        var id = $(this).attr('id');
-        Shiny.setInputValue('view_saved_list', id, {priority: 'event'});
-      });
-      table.on('click', 'button.delete_saved_list', function() {
-        var id = $(this).attr('id');
-        Shiny.setInputValue('delete_saved_list', id, {priority: 'event'});
-      });
-    ")
+        table.on('click', 'button.view_saved_list', function() {
+          var id = $(this).attr('id');
+          Shiny.setInputValue('view_saved_list', id, {priority: 'event'});
+        });
+        table.on('click', 'button.delete_saved_list', function() {
+          var id = $(this).attr('id');
+          Shiny.setInputValue('delete_saved_list', id, {priority: 'event'});
+        });
+      ")
       )
     })
-
   })
+
 
   ###------Observer: Edit Saved Shopping List ---------
   # ReactiveVal to hold the indices you want selected
   selected_indices_rv <- reactiveVal(NULL)
 
-  # In your edit observer, set the indices
   observeEvent(input$edit_saved_list, {
     list_id <- sub("^edit_", "", input$edit_saved_list)
-    saved_lists <- saved_lists_rv()
-    sel <- Filter(function(x) x$id == list_id, saved_lists)
-    if (length(sel) == 1) {
+
+    # Load flat tibble
+    saved_lists <- load_shopping_items()
+    if (is.null(saved_lists)) {
+      saved_lists <- tibble(
+        item_id = character(),
+        shopping_list_id = character(),
+        recipe_id = character(),
+        item = character(),
+        unit = character(),
+        store = character(),
+        quantity = numeric(),
+        have = logical(),
+        timestamp = as.POSIXct(character()),
+        recipe_title = character(),
+        multiplier = integer()
+      )
+    }
+
+    this_list <- saved_lists %>% filter(shopping_list_id == list_id)
+
+    if (nrow(this_list) > 0) {
       editing_list_id(list_id)
 
-      saved_recipe_ids <- sapply(sel[[1]]$recipes, `[[`, "id")
-      all_recs <- recipes_rv()
-      selected_indices <- which(sapply(all_recs, function(r) r$id) %in% saved_recipe_ids)
+      # Get unique recipe IDs and their multipliers
+      saved_recipe_ids <- unique(this_list$recipe_id)
+      selected_indices <- which(sapply(recipes_rv(), function(r) r$id) %in% saved_recipe_ids)
 
-      selected_indices_rv(selected_indices)  # store indices reactively
+      selected_indices_rv(selected_indices)
 
-      # Also update other reactives as before...
-      new_multipliers <- list()
-      for (r in sel[[1]]$recipes) {
-        new_multipliers[[r$id]] <- r$multiplier
-      }
-      recipe_multipliers(new_multipliers)
+      # Reconstruct multipliers from the flat tibble
+      new_multipliers <- this_list %>%
+        select(recipe_id, multiplier) %>%
+        distinct() %>%
+        deframe()  # named vector
 
-      have_items(list())
+      recipe_multipliers(as.list(new_multipliers))
+
+      have_items(list())  # or rehydrate from this_list if needed
 
       updateTabsetPanel(session, "main_tabs", selected = "Shopping List")
     }
   })
+
 
   ###----- Observer: Wait until rows are ready   ------
   # Observer to select rows once DT is ready (input$shopping_table_rows_all exists)
