@@ -5,11 +5,12 @@ library(dplyr)
 library(later)
 
 ### -- Data logic ----
-load_recipes <- function() {
-  if (!file.exists("recipes_flat.rds") || !file.exists("ingredients_flat.rds")) return(list())
 
-  recipes <- readRDS("recipes_flat.rds")
-  ingredients <- readRDS("ingredients_flat.rds")
+ss <-"1SYo6kXx2y4RzXaEuOfD70ZnrLbnWDFMV4zjXsKVPMdM"
+
+load_recipes <- function() {
+  recipes <- read_sheet(ss, sheet = "recipes")
+  ingredients <- read_sheet(ss, sheet = "ingredients")
 
   # Join back into nested list for rendering
   split_recipes <- lapply(seq_len(nrow(recipes)), function(i) {
@@ -27,78 +28,75 @@ load_recipes <- function() {
   return(split_recipes)
 }
 
-save_recipes <- function(rec_list) {
-  if (length(rec_list) == 0) {
-    saveRDS(data.frame(), "recipes_flat.rds")
-    saveRDS(data.frame(), "ingredients_flat.rds")
-    return()
-  }
-
-  recipes_df <- do.call(rbind, lapply(rec_list, function(r) {
-    data.frame(
-      id = r$id,
-      title = r$title,
-      instructions = r$instructions,
-      source = r$source %||% NA_character_,
-      stringsAsFactors = FALSE
-    )
-  }))
-
-  ingredients_df <- do.call(rbind, lapply(rec_list, function(r) {
-    if (is.null(r$ingredients) || nrow(r$ingredients) == 0) return(NULL)
-    cbind(recipe_id = r$id, r$ingredients)
-  }))
-
-  saveRDS(recipes_df, "recipes_flat.rds")
-  saveRDS(ingredients_df, "ingredients_flat.rds")
+save_recipes <- function(df) {
+  sheet_write(df, ss = ss, sheet = "recipes")
 }
 
-save_recipes <- function(rec_list) {
-  if (length(rec_list) == 0) {
-    saveRDS(data.frame(), "recipes_flat.rds")
-    saveRDS(data.frame(), "ingredients_flat.rds")
-    return()
-  }
-
-  recipes_df <- do.call(rbind, lapply(rec_list, function(r) {
-    data.frame(
-      id = r$id,
-      title = r$title,
-      instructions = r$instructions,
-      source = r$source %||% NA_character_,
-      stringsAsFactors = FALSE
-    )
-  }))
-
-  ingredients_df <- do.call(rbind, lapply(rec_list, function(r) {
-    if (is.null(r$ingredients) || nrow(r$ingredients) == 0) return(NULL)
-    cbind(recipe_id = r$id, r$ingredients)
-  }))
-
-  saveRDS(recipes_df, "recipes_flat.rds")
-  saveRDS(ingredients_df, "ingredients_flat.rds")
+save_ingredients <- function(df) {
+  sheet_write(df, ss = ss, sheet = "ingredients")
 }
+
+save_shopping_items <- function(shopping_lists) {
+  flat_df <- flatten_shopping_lists(shopping_lists)
+  sheet_write(flat_df, ss = ss, sheet = "shopping_items")
+}
+
+
+# save_recipes <- function(rec_list) {
+#   if (length(rec_list) == 0) {
+#     saveRDS(data.frame(), "recipes_flat.rds")
+#     saveRDS(data.frame(), "ingredients_flat.rds")
+#     return()
+#   }
+#
+#   recipes_df <- do.call(rbind, lapply(rec_list, function(r) {
+#     data.frame(
+#       id = r$id,
+#       title = r$title,
+#       instructions = r$instructions,
+#       source = r$source %||% NA_character_,
+#       stringsAsFactors = FALSE
+#     )
+#   }))
+#
+#   ingredients_df <- do.call(rbind, lapply(rec_list, function(r) {
+#     if (is.null(r$ingredients) || nrow(r$ingredients) == 0) return(NULL)
+#     cbind(recipe_id = r$id, r$ingredients)
+#   }))
+#
+#   saveRDS(recipes_df, "recipes_flat.rds")
+#   saveRDS(ingredients_df, "ingredients_flat.rds")
+# }
 
 load_shopping_items <- function() {
-  if (file.exists("data/shopping_items.rds")) {
-    readRDS("data/shopping_items.rds")
-  } else {
-    tibble::tibble(
-      item_id = character(),
-      shopping_list_id = character(),
-      recipe_id = character(),
-      item = character(),
-      unit = character(),
-      store = character(),
-      quantity = numeric(),
-      have = logical()
-    )
-  }
+    shopping_items <- read_sheet(ss, sheet = "shopping_items")
+    if(!is.null(shopping_items)){
+     shopping_items <- tibble::tibble(
+        item_id = character(),
+        shopping_list_id = character(),
+        recipe_id = character(),
+        item = character(),
+        unit = character(),
+        store = character(),
+        quantity = numeric(),
+        have = logical()
+      )
+    }
 }
 
-save_shopping_items <- function(df) {
-  saveRDS(df, "data/shopping_items.rds")
+flatten_shopping_lists <- function(shopping_lists) {
+
+  print(str(shopping_lists))
+  bind_rows(lapply(shopping_lists, function(entry) {
+    entry$items %>%
+      mutate(
+        shopping_id = entry$id,
+        timestamp = entry$timestamp,
+        recipe_info = paste(sapply(entry$recipes, function(x) paste0(x$title, " x", x$multiplier)), collapse = "; ")
+      )
+  }))
 }
+
 
 
 `%||%` <- function(a, b) if (!is.null(a)) a else b
@@ -225,9 +223,9 @@ server <- function(input, output, session) {
   }
 
   # Load saved shopping lists once at startup
-  shopping_file <- "shopping_lists.rds"
-  if (file.exists(shopping_file)) {
-    saved_lists_rv(readRDS(shopping_file))
+  shopping_file <- load_shopping_items()
+  if (!is.null(shopping_file)) {
+    saved_lists_rv(shopping_file)
   } else {
     saved_lists_rv(list())
   }
@@ -870,9 +868,9 @@ server <- function(input, output, session) {
     }
 
     # Load existing saved shopping lists or create empty
-    shopping_file <- "shopping_lists.rds"
-    if (file.exists(shopping_file)) {
-      saved_lists <- readRDS(shopping_file)
+    shopping_file <- load_shopping_items()
+    if (!is.null(shopping_file)) {
+      saved_lists <- shopping_file
     } else {
       saved_lists <- list()
     }
@@ -896,11 +894,11 @@ server <- function(input, output, session) {
 
     # Update saved_lists reactive
     current_lists <- saved_lists_rv()
-    new_lists <- c(current_lists, list(new_entry))
+    new_lists <- append(current_lists, list(new_entry))
     saved_lists_rv(new_lists)
 
     # Save to disk
-    saveRDS(new_lists, "shopping_lists.rds")
+    save_shopping_items(new_lists)
 
     output$complete_status <- renderText(paste0("Shopping list saved at ", format(new_entry$timestamp, "%Y-%m-%d %H:%M:%S")))
   })
@@ -938,7 +936,7 @@ server <- function(input, output, session) {
       saved_lists[[idx]]$items <- all_ingredients
       saved_lists[[idx]]$timestamp <- Sys.time()
 
-      saveRDS(saved_lists, "shopping_lists.rds")
+      save_shopping_items(saved_lists)
       saved_lists_rv(saved_lists)
 
       showNotification("Shopping list updated successfully.", type = "message")
@@ -1014,8 +1012,8 @@ server <- function(input, output, session) {
   ### ------ Observer: Saved Shopping Lists -----------
   observeEvent(input$view_saved_list, {
     id <- sub("view_", "", input$view_saved_list)
-    shopping_file <- "shopping_lists.rds"
-    saved_lists <- if (file.exists(shopping_file)) readRDS(shopping_file) else list()
+    shopping_file <- load_shopping_items()
+    saved_lists <- if(is.null(shopping_file))list()
     list_to_show <- Filter(function(x) x$id == id, saved_lists)
     if (length(list_to_show) == 1) {
       show_list <- list_to_show[[1]]
@@ -1041,14 +1039,14 @@ server <- function(input, output, session) {
   observeEvent(input$delete_saved_list, {
     id <- sub("delete_", "", input$delete_saved_list)
 
-    shopping_file <- "shopping_lists.rds"
-    saved_lists <- if (file.exists(shopping_file)) readRDS(shopping_file) else list()
+    shopping_file <- load_shopping_items()
+    saved_lists <- if (is.null(shopping_file)) list()
 
     # Filter out the list to delete
     saved_lists <- Filter(function(x) x$id != id, saved_lists)
 
     # Save the updated list back to disk
-    saveRDS(saved_lists, shopping_file)
+    save_shopping_items(saved_lists)
 
     # Clear details UI if currently showing this list
     output$saved_list_details <- renderUI(NULL)
