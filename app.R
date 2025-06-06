@@ -5,11 +5,82 @@ library(dplyr)
 library(later)
 
 ### -- Data logic ----
-data_file <- "recipes.rds"
-if (!file.exists(data_file)) saveRDS(list(), data_file)
+load_recipes <- function() {
+  if (!file.exists("recipes_flat.rds") || !file.exists("ingredients_flat.rds")) return(list())
 
-load_recipes <- function() readRDS(data_file)
-save_recipes <- function(data) saveRDS(data, data_file)
+  recipes <- readRDS("recipes_flat.rds")
+  ingredients <- readRDS("ingredients_flat.rds")
+
+  # Join back into nested list for rendering
+  split_recipes <- lapply(seq_len(nrow(recipes)), function(i) {
+    rec <- recipes[i, ]
+    rec_ingredients <- ingredients[ingredients$recipe_id == rec$id, , drop = FALSE]
+    list(
+      id = rec$id,
+      title = rec$title,
+      instructions = rec$instructions,
+      source = rec$source,
+      ingredients = rec_ingredients[, c("item", "quantity", "unit", "store"), drop = FALSE]
+    )
+  })
+
+  return(split_recipes)
+}
+
+save_recipes <- function(rec_list) {
+  if (length(rec_list) == 0) {
+    saveRDS(data.frame(), "recipes_flat.rds")
+    saveRDS(data.frame(), "ingredients_flat.rds")
+    return()
+  }
+
+  recipes_df <- do.call(rbind, lapply(rec_list, function(r) {
+    data.frame(
+      id = r$id,
+      title = r$title,
+      instructions = r$instructions,
+      source = r$source %||% NA_character_,
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  ingredients_df <- do.call(rbind, lapply(rec_list, function(r) {
+    if (is.null(r$ingredients) || nrow(r$ingredients) == 0) return(NULL)
+    cbind(recipe_id = r$id, r$ingredients)
+  }))
+
+  saveRDS(recipes_df, "recipes_flat.rds")
+  saveRDS(ingredients_df, "ingredients_flat.rds")
+}
+
+save_recipes <- function(rec_list) {
+  if (length(rec_list) == 0) {
+    saveRDS(data.frame(), "recipes_flat.rds")
+    saveRDS(data.frame(), "ingredients_flat.rds")
+    return()
+  }
+
+  recipes_df <- do.call(rbind, lapply(rec_list, function(r) {
+    data.frame(
+      id = r$id,
+      title = r$title,
+      instructions = r$instructions,
+      source = r$source %||% NA_character_,
+      stringsAsFactors = FALSE
+    )
+  }))
+
+  ingredients_df <- do.call(rbind, lapply(rec_list, function(r) {
+    if (is.null(r$ingredients) || nrow(r$ingredients) == 0) return(NULL)
+    cbind(recipe_id = r$id, r$ingredients)
+  }))
+
+  saveRDS(recipes_df, "recipes_flat.rds")
+  saveRDS(ingredients_df, "ingredients_flat.rds")
+}
+
+
+
 
 `%||%` <- function(a, b) if (!is.null(a)) a else b
 
