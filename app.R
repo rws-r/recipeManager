@@ -36,24 +36,48 @@ save_ingredients <- function(df) {
   sheet_write(df, ss = ss, sheet = "ingredients")
 }
 
+expected_shopping_items <- function() {
+  tibble(
+    item_id = character(),
+    shopping_list_id = character(),
+    recipe_id = character(),
+    item = character(),
+    unit = character(),
+    store = character(),
+    quantity = numeric(),
+    have = logical(),
+    timestamp = as.POSIXct(character()),
+    recipe_title = character(),
+    multiplier = integer()
+  )
+}
+
+
 # ---- Save shopping lists to Google Sheets ----
 save_shopping_items <- function(shopping_lists) {
-  #flat_df <- flatten_shopping_lists(shopping_lists)
+  sheet_id <- ss
 
-  if (nrow(shopping_lists) == 0) {
-    message("No shopping items to save.")
+  if (is.null(shopping_lists) || nrow(shopping_lists) == 0) {
+    # Save empty skeleton to clear sheet
+    empty_df <- expected_shopping_items()
+    sheet_write(
+      data = empty_df,
+      ss = as_sheets_id(sheet_id),
+      sheet = "shopping_items"
+    )
+    message("Cleared shopping_items sheet (empty save).")
     return(invisible(NULL))
   }
 
-  # Replace with your actual Google Sheets ID or reactive
-  sheet_id <- ss
-
+  # Otherwise save the real data
   sheet_write(
     data = shopping_lists,
     ss = as_sheets_id(sheet_id),
     sheet = "shopping_items"
   )
+  message("Saved shopping_items sheet with", nrow(shopping_lists), "rows.")
 }
+
 
 
 # save_recipes <- function(rec_list) {
@@ -83,21 +107,34 @@ save_shopping_items <- function(shopping_lists) {
 # }
 
 load_shopping_items <- function() {
-    shopping_items <- read_sheet(ss, sheet = "shopping_items")
+  sheet_data <- tryCatch(
+    read_sheet(ss, sheet = "shopping_items"),
+    error = function(e) NULL
+  )
 
-    if(!is.null(shopping_items)){
-     shopping_items <- tibble::tibble(
-        item_id = character(),
-        shopping_list_id = character(),
-        recipe_id = character(),
-        item = character(),
-        unit = character(),
-        store = character(),
-        quantity = numeric(),
-        have = logical()
-      )
+  if (is.null(sheet_data) || nrow(sheet_data) == 0) {
+    return(expected_shopping_items())
+  }
+
+  # Ensure correct column types and order, fallback if missing columns
+  sheet_df <- as_tibble(sheet_data)
+  expected_df <- expected_shopping_items()
+
+  missing_cols <- setdiff(names(expected_df), names(sheet_df))
+  if (length(missing_cols) > 0) {
+    # Add missing columns with appropriate empty vectors
+    for (col in missing_cols) {
+      sheet_df[[col]] <- expected_df[[col]][0]
     }
+  }
+
+  # Reorder columns to expected schema
+  sheet_df <- sheet_df[, names(expected_df)]
+
+  return(sheet_df)
 }
+
+
 
 # ---- Flatten shopping lists into a flat tibble for GS writing ----
 flatten_shopping_lists <- function(shopping_lists) {
@@ -1084,33 +1121,33 @@ server <- function(input, output, session) {
   ### ------- Observer: Delete Saved Shopping List -----
   observeEvent(input$delete_saved_list, {
     id <- sub("delete_", "", input$delete_saved_list)
+    cat("Deleting list id:", id, "\n")
 
-    # Load tibble from disk
     saved_lists <- load_shopping_items()
+    print(saved_lists)   # Check data loaded from Sheets
 
-    if (is.null(saved_lists) || nrow(saved_lists) == 0) {
-      saved_lists <- tibble(
-        item_id = character(),
-        shopping_list_id = character(),
-        recipe_id = character(),
-        item = character(),
-        unit = character(),
-        store = character(),
-        quantity = numeric(),
-        have = logical(),
-        timestamp = as.POSIXct(character()),
-        recipe_title = character(),
-        multiplier = integer()
-      )
-    }
-
-
-    # Filter out rows with the matching shopping_list_id
-    print(str(saved_lists))
     updated_lists <- saved_lists %>% filter(shopping_list_id != id)
+    print(updated_lists) # Check filtered result before saving
 
-    # Save back
     save_shopping_items(updated_lists)
+
+    saved_lists_rv(load_shopping_items())  # refresh reactive with updated sheet data
+
+    # if (is.null(saved_lists) || nrow(saved_lists) == 0) {
+    #   saved_lists <- tibble(
+    #     item_id = character(),
+    #     shopping_list_id = character(),
+    #     recipe_id = character(),
+    #     item = character(),
+    #     unit = character(),
+    #     store = character(),
+    #     quantity = numeric(),
+    #     have = logical(),
+    #     timestamp = as.POSIXct(character()),
+    #     recipe_title = character(),
+    #     multiplier = integer()
+    #   )
+    # }
 
     # Clear any details showing
     output$saved_list_details <- renderUI(NULL)
