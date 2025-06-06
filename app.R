@@ -1,8 +1,8 @@
 library(shiny)
-library(uuid)
 library(DT)
 library(dplyr)
-library(later)
+library(googlesheets4)
+library(uuid)
 
 ### -- Data logic ----
 
@@ -36,9 +36,23 @@ save_ingredients <- function(df) {
   sheet_write(df, ss = ss, sheet = "ingredients")
 }
 
+# ---- Save shopping lists to Google Sheets ----
 save_shopping_items <- function(shopping_lists) {
   flat_df <- flatten_shopping_lists(shopping_lists)
-  sheet_write(flat_df, ss = ss, sheet = "shopping_items")
+
+  if (nrow(flat_df) == 0) {
+    message("No shopping items to save.")
+    return(invisible(NULL))
+  }
+
+  # Replace with your actual Google Sheets ID or reactive
+  sheet_id <- ss
+
+  sheet_write(
+    data = flat_df,
+    ss = as_sheets_id(sheet_id),
+    sheet = "shopping_items"
+  )
 }
 
 
@@ -84,17 +98,46 @@ load_shopping_items <- function() {
     }
 }
 
+# ---- Flatten shopping lists into a flat tibble for GS writing ----
 flatten_shopping_lists <- function(shopping_lists) {
+  if (length(shopping_lists) == 0) {
+    return(tibble(
+      shopping_list_id = character(),
+      recipe_id = character(),
+      item = character(),
+      unit = character(),
+      store = character(),
+      quantity = numeric(),
+      have = logical()
+    ))
+  }
 
-  print(str(shopping_lists))
-  bind_rows(lapply(shopping_lists, function(entry) {
-    entry$items %>%
-      mutate(
-        shopping_id = entry$id,
-        timestamp = entry$timestamp,
-        recipe_info = paste(sapply(entry$recipes, function(x) paste0(x$title, " x", x$multiplier)), collapse = "; ")
-      )
-  }))
+  flat_items <- lapply(shopping_lists, function(sl) {
+    shopping_list_id <- sl$id
+    recipes <- sl$recipes
+    items <- sl$items
+
+    # Defensive: handle empty recipes or items
+    if (length(recipes) == 0 || nrow(items) == 0) {
+      return(tibble())
+    }
+
+    # For each recipe, replicate items and add recipe_id, shopping_list_id
+    df_list <- lapply(recipes, function(r) {
+      recipe_id <- r$id
+      items %>%
+        mutate(
+          shopping_list_id = shopping_list_id,
+          recipe_id = recipe_id,
+          have = as.logical(have)
+        ) %>%
+        select(shopping_list_id, recipe_id, item, unit, store, quantity, have)
+    })
+
+    bind_rows(df_list)
+  })
+
+  bind_rows(flat_items)
 }
 
 
@@ -166,7 +209,7 @@ server <- function(input, output, session) {
     data.frame(item = "", quantity = NA_real_, unit = "cup", store = "Any",stringsAsFactors = FALSE)
   )
   editing_recipe_id <- reactiveVal(NULL)
-  saved_lists_rv <- reactiveVal()
+  saved_lists_rv <- reactiveVal(list())
   recipe_to_delete <- reactiveVal(NULL)
   have_items <- reactiveVal(list())
   editing_list_id <- reactiveVal(NULL)
@@ -836,15 +879,13 @@ server <- function(input, output, session) {
     recipe_multipliers(current)
   })
 
-  ### ----- Observer: Complete Shopping List -----------
+  # ---- Observer example snippet for complete_list ----
   observeEvent(input$complete_list, {
-    req(input$shopping_table_rows_selected)  # Require some recipes selected
+    req(input$shopping_table_rows_selected)
 
-    # Get currently selected recipes and their multipliers
     recs <- recipes_rv()[input$shopping_table_rows_selected]
     mults <- recipe_multipliers()
 
-    # Build full ingredient list with multipliers applied
     all_ingredients <- do.call(rbind, lapply(recs, function(r) {
       multiplier <- mults[[r$id]] %||% 1
       df <- r$ingredients
@@ -852,12 +893,10 @@ server <- function(input, output, session) {
       df
     }))
 
-    # Group and sum quantities by item, unit, store
     all_ingredients <- all_ingredients %>%
       group_by(item, unit, store) %>%
       summarise(quantity = sum(quantity, na.rm = TRUE), .groups = "drop")
 
-    # Exclude items that user marked as "have"
     state <- have_items()
     all_ingredients$have <- sapply(all_ingredients$item, function(x) isTRUE(state[[x]]))
     shopping_to_save <- all_ingredients %>% filter(!have)
@@ -867,37 +906,24 @@ server <- function(input, output, session) {
       return()
     }
 
-    # Load existing saved shopping lists or create empty
-    shopping_file <- load_shopping_items()
-    if (!is.null(shopping_file)) {
-      saved_lists <- shopping_file
-    } else {
-      saved_lists <- list()
-    }
-
-    # Create new shopping list entry with timestamp and unique id, and recipe.
-    selected_recipe_info <- lapply(recs, function(r) {
-      list(
-        id = r$id,
-        title = r$title,
-        multiplier = mults[[r$id]] %||% 1
-      )
-    })
-
+    current_lists <- saved_lists_rv()
     new_entry <- list(
       id = UUIDgenerate(),
       timestamp = Sys.time(),
-      recipes = selected_recipe_info,  # <<-- added this
+      recipes = lapply(recs, function(r) {
+        list(
+          id = r$id,
+          title = r$title,
+          multiplier = mults[[r$id]] %||% 1
+        )
+      }),
       items = shopping_to_save
     )
 
-
-    # Update saved_lists reactive
-    current_lists <- saved_lists_rv()
-    new_lists <- append(current_lists, list(new_entry))
+    new_lists <- c(current_lists, list(new_entry))
     saved_lists_rv(new_lists)
 
-    # Save to disk
+    # Save immediately after updating reactive
     save_shopping_items(new_lists)
 
     output$complete_status <- renderText(paste0("Shopping list saved at ", format(new_entry$timestamp, "%Y-%m-%d %H:%M:%S")))
