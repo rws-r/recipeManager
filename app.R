@@ -3,14 +3,31 @@ library(DT)
 library(dplyr)
 library(googlesheets4)
 library(uuid)
+library(purrr)
+library(tibble)
 
 ### -- Data logic ----
 
 ss <-"1SYo6kXx2y4RzXaEuOfD70ZnrLbnWDFMV4zjXsKVPMdM"
 
-load_recipes <- function() {
-  recipes <- read_sheet(ss, sheet = "recipes")
-  ingredients <- read_sheet(ss, sheet = "ingredients")
+load_recipes_only <- function(){
+  read_sheet(ss, sheet = "recipes")
+}
+
+load_ingredients_only <- function(){
+  read_sheet(ss, sheet = "ingredients")
+}
+
+load_recipes <- function(recOnly = NULL,
+                         ingOnly = NULL) {
+  if(is.null(recOnly))
+    recipes <- load_recipes_only()
+  else
+    recipies <- recOnly
+  if(is.null(ingOnly))
+    ingredients <- load_ingredients_only()
+  else
+    ingredients <- ingOnly
 
   # Join back into nested list for rendering
   split_recipes <- lapply(seq_len(nrow(recipes)), function(i) {
@@ -28,12 +45,46 @@ load_recipes <- function() {
   return(split_recipes)
 }
 
-save_recipes <- function(df) {
+save_ingredients <- function(df) {
+  sheet_write(df, ss = ss, sheet = "ingredients")
+}
+
+save_recipes_only <- function(df) {
   sheet_write(df, ss = ss, sheet = "recipes")
 }
 
-save_ingredients <- function(df) {
+save_ingredients_only <- function(df) {
   sheet_write(df, ss = ss, sheet = "ingredients")
+}
+
+flatten_recipes <- function(recipe_list){
+  # 1. Flatten top-level recipe metadata into a dataframe
+  recipe_df <- purrr::map_dfr(recipe_list, ~{
+    tibble::tibble(
+      id = .x$id,
+      title = .x$title,
+      instructions = .x$instructions,
+      source = .x$source
+    )
+  })
+
+  # 2. Flatten all ingredients and include parent recipe_id
+  ingredients_df <- purrr::map_dfr(recipe_list, ~{
+    if (is.null(.x$ingredients)) return(NULL)
+    dplyr::mutate(.x$ingredients, recipe_id = .x$id)
+  })
+
+  return(list(recipe_df,ingredients_df))
+}
+
+save_recipes <- function(df) {
+  if(inherits(df,"list")){
+
+  }else{
+    stop("Malformed data supplied to save_recipes().")
+  }
+
+  sheet_write(df, ss = ss, sheet = "recipes")
 }
 
 expected_shopping_items <- function() {
@@ -52,6 +103,9 @@ expected_shopping_items <- function() {
   )
 }
 
+sanitize_id <- function(x) {
+  gsub("[^a-zA-Z0-9]", "_", x)
+}
 
 # ---- Save shopping lists to Google Sheets ----
 save_shopping_items <- function(shopping_lists) {
@@ -197,8 +251,8 @@ ui <- fluidPage(
                            uiOutput("ingredient_ui"),
                            actionButton("add_ing", "Add Ingredient"),
                            hr(),
-                           actionButton("save_recipe", "Save Recipe"),
                            textOutput("save_status"),
+                           actionButton("save_recipe", "Save Recipe"),
                            conditionalPanel(
                              condition = "output.is_editing_rec === true",
                              actionButton("cancel_edit", "Cancel Edit", icon = icon("times"), style = "margin-top: 10px;")
@@ -226,7 +280,7 @@ ui <- fluidPage(
               ),
               tabPanel("Saved Lists",
                        h3("Previously Saved Shopping Lists"),
-                       DTOutput("saved_lists_table"),
+                       DTOutput("saved_shopping_lists_table"),
                        uiOutput("saved_list_details")
               ),
               tabPanel("Ingredients",
@@ -241,22 +295,24 @@ ui <- fluidPage(
 # -- Server ----
 server <- function(input, output, session) {
 
+  gs4_auth(path = "gs.json")
+
   ## ----- Reactive Vals ----------
   recipes_rv <- reactiveVal(load_recipes())
   ingredients <- reactiveVal(
     data.frame(item = "", quantity = NA_real_, unit = "cup", store = "Any",stringsAsFactors = FALSE)
   )
   editing_recipe_id <- reactiveVal(NULL)
-  saved_lists_rv <- reactiveVal(list())
+  saved_shopping_lists_rv <- reactiveVal(list())
   recipe_to_delete <- reactiveVal(NULL)
   have_items <- reactiveVal(list())
-  editing_list_id <- reactiveVal(NULL)
+  editing_shopping_list_id <- reactiveVal(NULL)
   selected_indices_rv <- reactiveVal(NULL)
   pending_canonical_decision <- reactiveVal(NULL)
 
 
   output$is_editing_shop <- reactive({
-    !is.null(editing_list_id()) && nzchar(editing_list_id())
+    !is.null(editing_shopping_list_id()) && nzchar(editing_shopping_list_id())
   })
   outputOptions(output, "is_editing_shop", suspendWhenHidden = FALSE)
 
@@ -306,9 +362,9 @@ server <- function(input, output, session) {
   # Load saved shopping lists once at startup
   shopping_file <- load_shopping_items()
   if (!is.null(shopping_file)) {
-    saved_lists_rv(shopping_file)
+    saved_shopping_lists_rv(shopping_file)
   } else {
-    saved_lists_rv(list())
+    saved_shopping_lists_rv(list())
   }
 
 
@@ -411,7 +467,6 @@ server <- function(input, output, session) {
       saveRDS(all_items, ingredient_file)
     }
 
-
     all_recipes <- load_recipes()
     id_edit <- editing_recipe_id()
 
@@ -438,7 +493,11 @@ server <- function(input, output, session) {
       editing_recipe_id(NULL)
     }
 
-    save_recipes(all_recipes)
+    flat_recipes <- flatten_recipes(all_recipes)
+
+    save_recipes_only(flat_recipes[[1]])
+    save_ingredients_only(flat_recipes[[2]])
+    #save_recipes(all_recipes)
     recipes_rv(all_recipes)
     ingredients(data.frame(item = "", quantity = NA_real_, unit = "cup", stringsAsFactors = FALSE))
     updateTextInput(session, "title", value = "")
@@ -671,7 +730,6 @@ server <- function(input, output, session) {
     }
 
     recipe_to_delete(id)
-
     showModal(modalDialog(
       title = "Confirm Delete",
       "Are you sure you want to delete this recipe?",
@@ -688,13 +746,22 @@ server <- function(input, output, session) {
   ### ------ Observer: Confirm delete ---------
   observeEvent(input$confirm_delete, {
     req(recipe_to_delete())
-    recs <- recipes_rv()
-    recs <- Filter(function(r) r$id != recipe_to_delete(), recs)
-    save_recipes(recs)
+
+    recOnly <- load_recipes_only()
+    ingOnly <- load_ingredients_only()
+
+    recOnly <- recOnly[recOnly$id != recipe_to_delete(),]
+    ingOnly <- ingOnly[ingOnly$recipe_id != recipe_to_delete(),]
+
+    save_recipes_only(recOnly)
+    save_ingredients_only(ingOnly)
+
+    recs <- load_recipes(recOnly,ingOnly)
     recipes_rv(recs)
     output$save_status <- renderText("Recipe deleted.")
     recipe_to_delete(NULL)
     removeModal()
+
     ingredients(data.frame(item = "", quantity = NA_real_, unit = "cup", stringsAsFactors = FALSE))
     updateTextInput(session, "title", value = "")
     updateTextAreaInput(session, "instructions", value = "")
@@ -726,7 +793,6 @@ server <- function(input, output, session) {
     updateTextAreaInput(session, "instructions", value = "")
     editing_recipe_id(NULL)
   })
-
 
   ## ------ Render UI: Recipe viewer ---------
   output$recipe_viewer <- renderUI({
@@ -774,11 +840,13 @@ server <- function(input, output, session) {
   }, server = TRUE)  # <-- here
 
 
+  ###----Observer: Editing Shopping List ID
+  observeEvent(editing_shopping_list_id(), {
+    req(editing_shopping_list_id())
+    saved_shopping_lists <- saved_shopping_lists_rv()
+    edshopid <- editing_shopping_list_id()
 
-  observeEvent(editing_list_id(), {
-    req(editing_list_id())
-    saved_lists <- saved_lists_rv()
-    sel <- Filter(function(x) x$id == editing_list_id(), saved_lists)
+    sel <- saved_shopping_lists[saved_shopping_lists$shopping_list_id==edshopid,]
     if(length(sel) == 1) {
       saved_recipe_ids <- sapply(sel[[1]]$recipes, `[[`, "id")
       all_recs <- recipes_rv()
@@ -831,12 +899,16 @@ server <- function(input, output, session) {
 
     rows <- lapply(1:nrow(all_ingredients), function(i) {
       row <- all_ingredients[i, ]
-      checkbox_id <- paste0("have_", gsub("\\s+", "_", row$item))
+      checkbox_id <- paste0("have_", sanitize_id(row$item))
 
 
       fluidRow(
         style = if (row$have) "color: #aaa; text-decoration: line-through;" else "",
-        column(1, checkboxInput(checkbox_id, NULL, value = row$have)),
+        column(1, checkboxInput(
+          inputId = paste0("have_", sanitize_id(row$item)),
+          value = have_items[[sanitize_id(row$item)]] %||% FALSE,
+          label = NULL
+        )),
         column(5, row$item),
         column(2, row$quantity),
         column(2, row$unit),
@@ -858,16 +930,16 @@ server <- function(input, output, session) {
       conditionalPanel(
         condition = "output.is_editing_shop === false",
         tagList(
+          textOutput("complete_status"),
           actionButton("complete_list", "Save Shopping List"),
-          textOutput("complete_status")
         )
       ),
       conditionalPanel(
         condition = "output.is_editing_shop === true",
         tagList(
+          textOutput("complete_status"),
           actionButton("save_edited_list", "Save Edited Shopping List"),
-          actionButton("cancel_edit_list", "Cancel Edit"),
-          textOutput("complete_status")
+          actionButton("cancel_edit_list", "Cancel Edit")
         )
       )
 
@@ -917,12 +989,13 @@ server <- function(input, output, session) {
     recipe_multipliers(current)
   })
 
-  ### ---- Observer: for complete_list ----
+  ### ---- Observer: Save shopping list (complete list) ----
   observeEvent(input$complete_list, {
     req(input$shopping_table_rows_selected)
 
     recs <- recipes_rv()[input$shopping_table_rows_selected]
     mults <- recipe_multipliers()
+
 
     all_ingredients <- do.call(rbind, lapply(recs, function(r) {
       multiplier <- mults[[r$id]] %||% 1
@@ -943,19 +1016,25 @@ server <- function(input, output, session) {
     shopping_list_id <- UUIDgenerate()
     timestamp <- Sys.time()
 
+    # Assuming 'shopping_items' is your data frame containing the shopping list items
+    have_statuses <- sapply(all_ingredients$item, function(id) {
+      input[[paste0("have_", sanitize_id(id))]]
+    })
+
     flat_shopping_list <- all_ingredients %>%
       mutate(
         shopping_list_id = shopping_list_id,
-        timestamp = timestamp,
-        have = FALSE  # or whatever your logic is
-      ) %>%
+        timestamp = timestamp)
+
+    flat_shopping_list$have <- have_statuses[flat_shopping_list$item]
+    print(flat_shopping_list)
+    flat_shopping_list <- flat_shopping_list %>%
       select(shopping_list_id, timestamp, recipe_id, recipe_title, multiplier, item, unit, store, quantity, have)
 
     # Append flat_shopping_list to your reactive or saved data
-
-    current_lists <- saved_lists_rv()
+    current_lists <- saved_shopping_lists_rv()
     new_lists <- bind_rows(current_lists, flat_shopping_list)
-    saved_lists_rv(new_lists)
+    saved_shopping_lists_rv(new_lists)
 
     # Save directly to Google Sheets or RDS as one flat table
     save_shopping_items(new_lists)
@@ -965,48 +1044,45 @@ server <- function(input, output, session) {
 
   ###-----Observer: Save edited list ------
   observeEvent(input$save_edited_list, {
-    req(editing_list_id())
-    saved_lists <- saved_lists_rv()
+    req(editing_shopping_list_id())
+    edshoplisid <- editing_shopping_list_id()
+    saved_shopping_lists <- saved_shopping_lists_rv()
 
-    idx <- which(sapply(saved_lists, `[[`, "id") == editing_list_id())
-    if (length(idx) == 1) {
-      recs <- recipes_rv()[input$shopping_table_rows_selected]
-      mults <- recipe_multipliers()
+    # Remove old rows associated with this list
+    saved_shopping_lists <- saved_shopping_lists %>%
+      filter(shopping_list_id != edshoplisid)
 
-      selected_recipe_info <- lapply(recs, function(r) {
-        list(
-          id = r$id,
-          title = r$title,
-          multiplier = mults[[r$id]] %||% 1
-        )
-      })
+    recs <- recipes_rv()[input$shopping_table_rows_selected]
+    mults <- recipe_multipliers()
 
-      all_ingredients <- do.call(rbind, lapply(recs, function(r) {
-        multiplier <- mults[[r$id]] %||% 1
-        df <- r$ingredients
-        df$quantity <- df$quantity * multiplier
-        df
-      }))
+    # Generate new shopping list entries
+    new_rows <- bind_rows(lapply(recs, function(r) {
+      multiplier <- mults[[r$id]] %||% 1
+      df <- r$ingredients
+      df$quantity <- df$quantity * multiplier
+      df$shopping_list_id <- edshoplisid
+      df$recipe_id <- r$id
+      df$recipe_title <- r$title
+      df$multiplier <- multiplier
+      df$have <- r$have
+      df$timestamp <- Sys.time()
+      df$item_id <- NA
+      df
+    }))
 
-      all_ingredients <- all_ingredients %>%
-        group_by(item, unit, store) %>%
-        summarise(quantity = sum(quantity, na.rm = TRUE), .groups = "drop")
+    # Combine updated lists
+    updated_df <- bind_rows(saved_shopping_lists, new_rows)
 
-      saved_lists[[idx]]$recipes <- selected_recipe_info
-      saved_lists[[idx]]$items <- all_ingredients
-      saved_lists[[idx]]$timestamp <- Sys.time()
+    save_shopping_items(updated_df)
+    saved_shopping_lists_rv(updated_df)
 
-      save_shopping_items(saved_lists)
-      saved_lists_rv(saved_lists)
-
-      showNotification("Shopping list updated successfully.", type = "message")
-    }
+    showNotification("Shopping list updated successfully.", type = "message")
   })
 
 
   ## ------ Render DT: Saved Shopping LIsts -----------
-  output$saved_lists_table <- renderDT({
-    shopping_lists <- saved_lists_rv()
+  output$saved_shopping_lists_table <- renderDT({
+    shopping_lists <- saved_shopping_lists_rv()
 
     if (nrow(shopping_lists) == 0) {
       df_empty <- data.frame(
@@ -1073,14 +1149,13 @@ server <- function(input, output, session) {
     )
   })
 
-
-  ### ------ Observer: Saved Shopping Lists -----------
+  ### ------ Observer: View Saved Shopping Lists -----------
   observeEvent(input$view_saved_list, {
     id <- sub("view_", "", input$view_saved_list)
-    saved_lists <- saved_lists_rv()
+    saved_shopping_lists <- saved_shopping_lists_rv()
 
     # Extract rows matching the shopping_list_id
-    list_rows <- saved_lists %>% filter(shopping_list_id == id)
+    list_rows <- saved_shopping_lists %>% filter(shopping_list_id == id)
 
     if (nrow(list_rows) > 0) {
       # Extract timestamp (assume all rows have the same one)
@@ -1117,24 +1192,24 @@ server <- function(input, output, session) {
     }
   })
 
-
   ### ------- Observer: Delete Saved Shopping List -----
   observeEvent(input$delete_saved_list, {
     id <- sub("delete_", "", input$delete_saved_list)
     cat("Deleting list id:", id, "\n")
 
-    saved_lists <- load_shopping_items()
-    print(saved_lists)   # Check data loaded from Sheets
+    #saved_shopping_lists <- load_shopping_items()
+    saved_shopping_lists <- saved_shopping_lists_rv()
+  #  print(saved_shopping_lists)   # Check data loaded from Sheets
 
-    updated_lists <- saved_lists %>% filter(shopping_list_id != id)
-    print(updated_lists) # Check filtered result before saving
+    updated_lists <- saved_shopping_lists %>% filter(shopping_list_id != id)
+ #   print(updated_lists) # Check filtered result before saving
 
     save_shopping_items(updated_lists)
 
-    saved_lists_rv(load_shopping_items())  # refresh reactive with updated sheet data
+    saved_shopping_lists_rv(updated_lists)  # refresh reactive with updated sheet data
 
-    # if (is.null(saved_lists) || nrow(saved_lists) == 0) {
-    #   saved_lists <- tibble(
+    # if (is.null(saved_shopping_lists) || nrow(saved_shopping_lists) == 0) {
+    #   saved_shopping_lists <- tibble(
     #     item_id = character(),
     #     shopping_list_id = character(),
     #     recipe_id = character(),
@@ -1180,7 +1255,7 @@ server <- function(input, output, session) {
       df <- summary_df[, c("Time", "Recipes", "View", "Delete")]
     }
 
-    output$saved_lists_table <- renderDT({
+    output$saved_shopping_lists_table <- renderDT({
       datatable(
         df,
         escape = FALSE,
@@ -1205,7 +1280,6 @@ server <- function(input, output, session) {
     })
   })
 
-
   ###------Observer: Edit Saved Shopping List ---------
   # ReactiveVal to hold the indices you want selected
   selected_indices_rv <- reactiveVal(NULL)
@@ -1214,9 +1288,10 @@ server <- function(input, output, session) {
     list_id <- sub("^edit_", "", input$edit_saved_list)
 
     # Load flat tibble
-    saved_lists <- load_shopping_items()
-    if (is.null(saved_lists)) {
-      saved_lists <- tibble(
+    saved_shopping_lists <- saved_shopping_lists_rv()
+
+    if (is.null(saved_shopping_lists)) {
+      saved_shopping_lists <- tibble(
         item_id = character(),
         shopping_list_id = character(),
         recipe_id = character(),
@@ -1231,10 +1306,10 @@ server <- function(input, output, session) {
       )
     }
 
-    this_list <- saved_lists %>% filter(shopping_list_id == list_id)
+    this_list <- saved_shopping_lists[saved_shopping_lists$shopping_list_id==list_id,]
 
     if (nrow(this_list) > 0) {
-      editing_list_id(list_id)
+      editing_shopping_list_id(list_id)
 
       # Get unique recipe IDs and their multipliers
       saved_recipe_ids <- unique(this_list$recipe_id)
@@ -1244,18 +1319,18 @@ server <- function(input, output, session) {
 
       # Reconstruct multipliers from the flat tibble
       new_multipliers <- this_list %>%
-        select(recipe_id, multiplier) %>%
-        distinct() %>%
-        deframe()  # named vector
+        dplyr::select(recipe_id, multiplier) %>%
+        dplyr::distinct() %>%
+        tibble::deframe()  # named vector
 
       recipe_multipliers(as.list(new_multipliers))
 
-      have_items(list())  # or rehydrate from this_list if needed
+      rehydrated_have <- setNames(this_list$have, this_list$item_id)
+      have_items(as.list(rehydrated_have))
 
       updateTabsetPanel(session, "main_tabs", selected = "Shopping List")
     }
   })
-
 
   ###----- Observer: Wait until rows are ready   ------
   # Observer to select rows once DT is ready (input$shopping_table_rows_all exists)
@@ -1269,10 +1344,9 @@ server <- function(input, output, session) {
     })
   })
 
-
   ###-----Observer: Cancel edit shopping list --------
   observeEvent(input$cancel_edit_list, {
-    editing_list_id(NULL)      # Exit editing mode
+    editing_shopping_list_id(NULL)      # Exit editing mode
     recipe_multipliers(list()) # Reset multipliers (or reload original if needed)
     have_items(list())         # Reset have items if needed
 
