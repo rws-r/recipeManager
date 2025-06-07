@@ -23,7 +23,7 @@ load_recipes <- function(recOnly = NULL,
   if(is.null(recOnly))
     recipes <- load_recipes_only()
   else
-    recipies <- recOnly
+    recipes <- recOnly
   if(is.null(ingOnly))
     ingredients <- load_ingredients_only()
   else
@@ -372,7 +372,12 @@ server <- function(input, output, session) {
   output$ingredient_ui <- renderUI({
     df <- ingredients()
     n <- nrow(df)
-    all_recipes <- load_recipes()
+
+    if(is.null(recipes_rv()))
+      all_recipes <- load_recipes()
+    else
+      all_recipes <- recipes_rv()
+
     ingredient_pool <- attr(df, "ingredient_pool")
     if (is.null(ingredient_pool)) {
       ingredient_pool <- unique(unlist(lapply(all_recipes, function(r) r$ingredients$item)))
@@ -424,7 +429,7 @@ server <- function(input, output, session) {
     df <- rbind(df, data.frame(item = "", quantity = NA_real_, unit = "cup", store = "Any", stringsAsFactors = FALSE))
 
     # Append new values to ingredient pool so they persist in choices
-    all_recipes <- load_recipes()
+    all_recipes <- recipes_rv()
     prev_pool <- unique(unlist(lapply(all_recipes, function(r) r$ingredients$item)))
     new_pool <- unique(c(prev_pool, new_items))
     attr(df, "ingredient_pool") <- new_pool  # stash it temporarily
@@ -467,7 +472,11 @@ server <- function(input, output, session) {
       saveRDS(all_items, ingredient_file)
     }
 
-    all_recipes <- load_recipes()
+    if(is.null(recipes_rv()))
+      all_recipes <- load_recipes()
+    else
+      all_recipies <- recipes_rv()
+
     id_edit <- editing_recipe_id()
 
     if (is.null(id_edit)) {
@@ -479,7 +488,7 @@ server <- function(input, output, session) {
         ingredients = df
       )
       all_recipes <- c(all_recipes, list(new_recipe))
-      output$save_status <- renderText("Recipe saved!")
+      #output$save_status <- renderText("Recipe saved!")
     } else {
       idx <- which(sapply(all_recipes, `[[`, "id") == id_edit)
       if (length(idx) == 1) {
@@ -488,7 +497,7 @@ server <- function(input, output, session) {
         all_recipes[[idx]]$source <- input$source
         all_recipes[[idx]]$ingredients <- df
 
-        output$save_status <- renderText("Recipe updated!")
+        showNotification("Recipe Updated.", type = "message")
       }
       editing_recipe_id(NULL)
     }
@@ -497,6 +506,7 @@ server <- function(input, output, session) {
 
     save_recipes_only(flat_recipes[[1]])
     save_ingredients_only(flat_recipes[[2]])
+    showNotification("Recipe saved successfully.", type = "message")
     #save_recipes(all_recipes)
     recipes_rv(all_recipes)
     ingredients(data.frame(item = "", quantity = NA_real_, unit = "cup", stringsAsFactors = FALSE))
@@ -634,8 +644,6 @@ server <- function(input, output, session) {
     showNotification("Ingredient deleted.", type = "message")
   })
 
-
-
   ## ------ Render DT: Recipe table  ---------
   output$recipe_table <- renderDT({
     recs <- recipes_rv()
@@ -692,7 +700,12 @@ server <- function(input, output, session) {
   ### ------ Observer: Edit recipe ---------
   observeEvent(input$edit_recipe, {
     id <- sub("edit_", "", input$edit_recipe)
-    recs <- load_recipes()
+
+    if(is.null(recipes_rv()))
+      recs <- load_recipes()
+    else
+      recs <- recipes_rv()
+
     recipe <- Filter(function(r) r$id == id, recs)[[1]]
     if (!is.null(recipe)) {
       updateTextInput(session, "title", value = recipe$title)
@@ -716,7 +729,7 @@ server <- function(input, output, session) {
     updateTextInput(session, "title", value = "")
     updateTextAreaInput(session, "instructions", value = "")
     updateTextAreaInput(session, "source", value = "")
-    output$save_status <- renderText("Edit cancelled.")
+    showNotification("Edit cancelled.", type = "message")
   })
 
 
@@ -747,8 +760,14 @@ server <- function(input, output, session) {
   observeEvent(input$confirm_delete, {
     req(recipe_to_delete())
 
-    recOnly <- load_recipes_only()
-    ingOnly <- load_ingredients_only()
+    if(is.null(recipes_rv())){
+      recOnly <- load_recipes_only()
+      ingOnly <- load_ingredients_only()
+    }else{
+      rf <- flatten_recipes(recipes_rv())
+      recOnly <- rf[[1]]
+      ingOnly <- rf[[2]]
+    }
 
     recOnly <- recOnly[recOnly$id != recipe_to_delete(),]
     ingOnly <- ingOnly[ingOnly$recipe_id != recipe_to_delete(),]
@@ -758,7 +777,7 @@ server <- function(input, output, session) {
 
     recs <- load_recipes(recOnly,ingOnly)
     recipes_rv(recs)
-    output$save_status <- renderText("Recipe deleted.")
+    showNotification("Recipe deleted.", type = "message")
     recipe_to_delete(NULL)
     removeModal()
 
@@ -1038,7 +1057,7 @@ server <- function(input, output, session) {
     # Save directly to Google Sheets or RDS as one flat table
     save_shopping_items(new_lists)
 
-    output$complete_status <- renderText(paste0("Shopping list saved at ", format(timestamp, "%Y-%m-%d %H:%M:%S")))
+    showNotification(paste0("Shopping list saved at ", format(timestamp, "%Y-%m-%d %H:%M:%S")), type = "message")
   })
 
   ###-----Observer: Save edited list ------
@@ -1227,7 +1246,7 @@ server <- function(input, output, session) {
     output$saved_list_details <- renderUI(NULL)
 
     # Optional: show a message
-    output$complete_status <- renderText("Saved shopping list deleted.")
+    showNotification("Shopping list deleted successfully.", type = "message")
 
     # Refresh DT
     if (nrow(updated_lists) == 0) {
@@ -1354,7 +1373,7 @@ server <- function(input, output, session) {
     selectRows(proxy, NULL)
 
     # Clear status message
-    output$complete_status <- renderText("Edit cancelled.")
+    showNotification("Edit cancelled.", type = "message")
 
     # Optionally, switch back to non-editing mode in UI
   })
