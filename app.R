@@ -901,12 +901,11 @@ server <- function(input, output, session) {
       row <- all_ingredients[i, ]
       checkbox_id <- paste0("have_", sanitize_id(row$item))
 
-
       fluidRow(
         style = if (row$have) "color: #aaa; text-decoration: line-through;" else "",
         column(1, checkboxInput(
           inputId = paste0("have_", sanitize_id(row$item)),
-          value = have_items[[sanitize_id(row$item)]] %||% FALSE,
+          value = row$have,
           label = NULL
         )),
         column(5, row$item),
@@ -1327,6 +1326,7 @@ server <- function(input, output, session) {
 
       rehydrated_have <- setNames(this_list$have, this_list$item_id)
       have_items(as.list(rehydrated_have))
+
 
       updateTabsetPanel(session, "main_tabs", selected = "Shopping List")
     }
