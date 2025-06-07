@@ -107,6 +107,14 @@ sanitize_id <- function(x) {
   gsub("[^a-zA-Z0-9]", "_", x)
 }
 
+vectorize_table <- function(df){
+  x <- as.vector(as.matrix(df))
+  return(x)
+}
+vector_to_dataframe <- function(vec, name=NULL){
+  x <- setNames(data.frame(vec), name)
+}
+
 # ---- Save shopping lists to Google Sheets ----
 save_shopping_items <- function(shopping_lists) {
   sheet_id <- ss
@@ -310,7 +318,6 @@ server <- function(input, output, session) {
   selected_indices_rv <- reactiveVal(NULL)
   pending_canonical_decision <- reactiveVal(NULL)
 
-
   output$is_editing_shop <- reactive({
     !is.null(editing_shopping_list_id()) && nzchar(editing_shopping_list_id())
   })
@@ -323,13 +330,10 @@ server <- function(input, output, session) {
 
   proxy <- dataTableProxy("shopping_table")
 
-  ingredient_file <- "canonical_ingredients.rds"
+ #ingredient_file <- "canonical_ingredients.rds"
 
-  canonical_ingredients <- if (file.exists(ingredient_file)) {
-    readRDS(ingredient_file)
-  } else {
-    character()
-  }
+  canonical_ingredients <- read_sheet(ss,"canonical_ingredients")
+
   canonical_ingredients_rv <- reactiveVal(canonical_ingredients)
 
   # ------- Functions --------
@@ -385,12 +389,11 @@ server <- function(input, output, session) {
     ingredient_pool <- sort(na.omit(ingredient_pool))
 
     # Define known_terms here
-    known_terms <- canonical_ingredients_rv()
+    known_terms <- vectorize_table(canonical_ingredients_rv())
 
     new_items <- trimws(tolower(df$item))
     unknowns <- setdiff(new_items, known_terms)
     unknowns <- unknowns[unknowns != ""]  # remove blanks
-
 
     lapply(1:n, function(i) {
       fluidRow(
@@ -463,13 +466,13 @@ server <- function(input, output, session) {
 
     # After collecting df$item
     new_items <- unique(df$item)
-    existing_items <- canonical_ingredients_rv()
+    existing_items <- vectorize_table(canonical_ingredients_rv())
     all_items <- sort(unique(c(existing_items, new_items)))
 
     # Update if changed
     if (!identical(all_items, existing_items)) {
-      canonical_ingredients_rv(all_items)
-      saveRDS(all_items, ingredient_file)
+      canonical_ingredients_rv(vector_to_dataframe(all_items,"item"))
+      write_sheet(all_items, ss, "canonical_ingredients")
     }
 
     if(is.null(recipes_rv()))
@@ -521,7 +524,7 @@ server <- function(input, output, session) {
   observe({
     df <- ingredients()
     items <- tolower(trimws(df$item))
-    known <- canonical_ingredients_rv()
+    known <- vectorize_table(canonical_ingredients_rv())
     unknowns <- which(!(items %in% known) & items != "")
 
     if (length(unknowns) > 0 && is.null(pending_canonical_decision())) {
@@ -540,10 +543,10 @@ server <- function(input, output, session) {
     df <- ingredients()
 
     if (decision == "add") {
-      canon <- canonical_ingredients_rv()
+      canon <- vectorize_table(canonical_ingredients_rv())
       canon <- sort(unique(c(canon, name)))
-      canonical_ingredients_rv(canon)
-      saveRDS(canon, ingredient_file)
+      canonical_ingredients_rv(vector_to_dataframe(canon,"item"))
+      write_sheet(canonical_ingredients_rv(), ss, "canonical_ingredients")
     } else if (decision == "replace") {
       selected <- isolate(input$canonical_choice)
       df$item[row] <- selected
@@ -557,7 +560,8 @@ server <- function(input, output, session) {
 
   ## --------- Render: View Canonical Ingredients-------
   output$canonical_table <- renderDT({
-    data.frame(Ingredient = canonical_ingredients_rv(), stringsAsFactors = FALSE) %>%
+    print(vectorize_table(canonical_ingredients_rv()))
+    data.frame(Ingredient = vectorize_table(canonical_ingredients_rv()), stringsAsFactors = FALSE) %>%
       mutate(
         Edit = sprintf('<button class="edit_ingredient" id="edit_ing_%s">Edit</button>', Ingredient),
         Delete = sprintf('<button class="delete_ingredient" id="del_ing_%s">Delete</button>', Ingredient)
@@ -602,7 +606,7 @@ server <- function(input, output, session) {
   observeEvent(input$confirm_edit_ingredient, {
     old <- selected_indices_rv()
     new <- trimws(tolower(input$new_ingredient_name))
-    canon <- canonical_ingredients_rv()
+    canon <- vectorize_table(canonical_ingredients_rv())
 
     if (new == "" || new %in% canon) {
       showNotification("Invalid or duplicate name.", type = "error")
@@ -611,8 +615,8 @@ server <- function(input, output, session) {
 
     canon <- setdiff(canon, old)
     canon <- sort(unique(c(canon, new)))
-    canonical_ingredients_rv(canon)
-    saveRDS(canon, ingredient_file)
+    canonical_ingredients_rv(vector_to_dataframe(canon,"item"))
+    write_sheet(canonical_ingredients_rv(), ss, "canonical_ingredients")
 
     selected_indices_rv(NULL)
     removeModal()
@@ -635,10 +639,10 @@ server <- function(input, output, session) {
 
   ### ------ Observer: Confirm delete canonical ingredients ------
   observeEvent(input$confirm_delete_ingredient, {
-    canon <- canonical_ingredients_rv()
+    canon <- vectorize_table(canonical_ingredients_rv())
     canon <- setdiff(canon, selected_indices_rv())
-    canonical_ingredients_rv(canon)
-    saveRDS(canon, ingredient_file)
+    canonical_ingredients_rv(vector_to_dataframe(canon,"item"))
+    write_sheet(canonical_ingredients_rv(), ss, "canonical_ingredients")
     selected_indices_rv(NULL)
     removeModal()
     showNotification("Ingredient deleted.", type = "message")
