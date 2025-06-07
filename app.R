@@ -478,7 +478,7 @@ server <- function(input, output, session) {
     if(is.null(recipes_rv()))
       all_recipes <- load_recipes()
     else
-      all_recipies <- recipes_rv()
+      all_recipes <- recipes_rv()
 
     id_edit <- editing_recipe_id()
 
